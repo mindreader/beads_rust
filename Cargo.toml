@@ -64,7 +64,7 @@ unicode-width = "0.2"
 semver = "1.0"
 
 # Self-update (optional; gated behind the `self_update` feature)
-self_update = { version = "0.42", features = ["rustls", "signatures"], default-features = false, optional = true }
+self_update = { version = "0.44", features = ["rustls", "signatures"], default-features = false, optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
