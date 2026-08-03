@@ -154,6 +154,62 @@ fn notes_cleared_to_empty_is_refused() {
     assert_field_intact(&workspace, &id, "notes", BLOCK_ONE);
 }
 
+/// NO LENGTH THRESHOLD ANYWHERE. Three preservation checks in this fleet
+/// were found to skip their comparison when the sample was "too short to be
+/// meaningful", which turned a full clobber into a verified pass. A field
+/// holding four characters is still someone's content, so the guard is
+/// exercised here at the smallest sizes that can shrink at all.
+#[test]
+fn tiny_fields_are_guarded_at_every_size() {
+    common::init_test_logging();
+    // (stored, incoming) pairs, from a 4-char field down to a 1-char one.
+    let cases = [("abcd", "abc"), ("ab", "a"), ("x", "")];
+
+    for (old, new) in cases {
+        let (workspace, id) = workspace_with_issue("tiny field probe");
+        seed_notes(&workspace, &id, old);
+
+        let out = run_br(&workspace, ["update", &id, "--notes", new], "tiny");
+
+        assert!(
+            !out.status.success(),
+            "{old:?} -> {new:?} must be refused regardless of size, got: {}",
+            out.stdout
+        );
+        let err = structured_error(&out.stderr);
+        assert_eq!(err["code"], "DESTRUCTIVE_UPDATE");
+        assert_eq!(err["context"]["old_chars"], old.chars().count());
+        assert_eq!(err["context"]["new_chars"], new.chars().count());
+        assert_field_intact(&workspace, &id, "notes", old);
+    }
+}
+
+/// Sizes are counted in characters, not bytes, so a multi-byte field is not
+/// judged by its encoding. Shrinking from three characters to two is a
+/// refusal even though the byte count is larger than the character count.
+#[test]
+fn multibyte_fields_are_measured_in_characters() {
+    common::init_test_logging();
+    let (workspace, id) = workspace_with_issue("unicode probe");
+    seed_notes(&workspace, &id, "\u{4f60}\u{597d}\u{4e16}");
+
+    let out = run_br(
+        &workspace,
+        ["update", &id, "--notes", "\u{4f60}\u{597d}"],
+        "unicode",
+    );
+
+    assert!(
+        !out.status.success(),
+        "a 3-char -> 2-char shrink must be refused: {}",
+        out.stdout
+    );
+    let err = structured_error(&out.stderr);
+    assert_eq!(err["context"]["old_chars"], 3);
+    assert_eq!(err["context"]["new_chars"], 2);
+    assert_field_intact(&workspace, &id, "notes", "\u{4f60}\u{597d}\u{4e16}");
+}
+
 /// Every wholesale-settable free-text field reaches the guard, not just the
 /// one the bug was reported against. Each flag is exercised end to end
 /// through the real binary rather than assumed to share a code path.
