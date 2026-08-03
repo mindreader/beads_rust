@@ -194,6 +194,111 @@ fn no_snapshot_records_an_empty_value() {
     );
 }
 
+/// A snapshot whose value is trivially satisfiable must be backed by a live
+/// control assertion in the test that owns it.
+///
+/// `[]`, `{}`, `{"count": 0}` and a zero-byte file are all values that the
+/// command prints when it is WORKING and also when it is completely BROKEN.
+/// Recorded against a fixture that contains nothing, they assert nothing
+/// while occupying a line in the passing-test count. Five snapshots in this
+/// tree were in that state: four "empty result" cases ran on a bare `init`,
+/// and `orphans_json` recorded `[]` produced by a guard clause six early
+/// returns ahead of the scan the test was named for.
+///
+/// The convention, and what this enforces: if the correct answer really is
+/// empty, the test must first prove — in the same workspace, with the same
+/// command — that a non-empty answer is reachable. That control is what
+/// distinguishes "the filter correctly excluded everything" from "this
+/// command has stopped working". Marked by the string `control failed` in
+/// the control's assertion message, which is both the machine-checkable
+/// marker and the text a failing run prints.
+///
+/// The alternative to a control is to make the value non-trivial: give the
+/// fixture something to find, or compose the value with the surrounding
+/// facts (see `compose_invocation` in `tests/snapshots/mod.rs`).
+#[test]
+fn every_trivial_snapshot_has_a_live_control() {
+    let root = repo_root();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut offenders = Vec::new();
+
+    for snap in load_corpus() {
+        if !is_trivially_satisfiable(&snap.body) {
+            continue;
+        }
+        let Some(source) = snap.header.get("source") else {
+            continue;
+        };
+        let text = sources
+            .entry(source.clone())
+            .or_insert_with(|| fs::read_to_string(root.join(source)).unwrap_or_default());
+        let Some(owner) = enclosing_test_body(text, &snap.name) else {
+            offenders.push(format!(
+                "{}: records `{}` and no test in {source} could be located",
+                snap.file, snap.body
+            ));
+            continue;
+        };
+        if !owner.contains("control failed") {
+            offenders.push(format!(
+                "{}: records `{}` with no live control in its test",
+                snap.file, snap.body
+            ));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these snapshots record a value that a totally broken command also \
+         produces:\n  {}\n\
+         Before asserting the empty answer, prove in the same test that the \
+         same command returns something in the same workspace (assert it with \
+         a message containing `control failed`), or give the fixture data that \
+         makes the value non-trivial.",
+        offenders.join("\n  ")
+    );
+}
+
+/// Whether a recorded value is one that a completely broken command would
+/// also produce: nothing at all, an empty collection, or a structure whose
+/// every field is zero/empty.
+fn is_trivially_satisfiable(body: &str) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    is_trivial_json(&value)
+}
+
+fn is_trivial_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(map) => map.values().all(is_trivial_json),
+    }
+}
+
+/// Return the source text of the `#[test]` function that asserts `name`.
+///
+/// Finds the assertion by its snapshot name, walks back to the `#[test]`
+/// attribute that opens the function, and forward to the closing brace at
+/// column zero.
+fn enclosing_test_body(source: &str, name: &str) -> Option<String> {
+    let needle = format!("\"{name}\"");
+    let at = source.find(&needle)?;
+    let start = source[..at].rfind("#[test]")?;
+    let end = source[at..]
+        .find("\n}\n")
+        .map_or(source.len(), |rel| at + rel);
+    Some(source[start..end].to_string())
+}
+
 /// No snapshot may record a value that the test harness itself mangled.
 ///
 /// The normalizer that runs before recording used to redact any hyphenated

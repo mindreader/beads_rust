@@ -70,7 +70,7 @@ pub fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String
     parse_created_id(&output.stdout)
 }
 
-fn parse_created_id(stdout: &str) -> String {
+pub fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
     // Handle both formats: "Created bd-xxx: title" and "✓ Created bd-xxx: title"
     let normalized = line.strip_prefix("✓ ").unwrap_or(line);
