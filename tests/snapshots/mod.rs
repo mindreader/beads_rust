@@ -49,8 +49,60 @@ fn parse_created_id(stdout: &str) -> String {
 // Pre-compiled regex patterns for performance
 static ANSI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("ansi regex"));
-static ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b").expect("id regex"));
+/// Candidate `prefix-suffix` tokens for issue-ID redaction.
+///
+/// This deliberately over-matches; [`looks_like_issue_id`] decides. The
+/// pattern this replaced was `\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b`, which is to
+/// say ANY hyphenated word, and it silently destroyed content on its way
+/// into the recorded snapshots: `--dry-run`, `--no-color`, `--external-ref`,
+/// `parent-child`, `auto-discover`, `append-only`, `Agent-first`,
+/// `Power-user` and `Auto-import` were all replaced by `ID-REDACTED`.
+/// `create_help.snap` therefore recorded `--ID-REDACTED <EXTERNAL_REF>` and
+/// could not have failed if the flag had been renamed — the one test
+/// guarding the CLI surface was blind to exactly the thing it guards.
+///
+/// Redaction is normalization, and normalization runs BEFORE recording, so
+/// an over-broad rule here is worse than an over-broad rule anywhere else in
+/// the suite: it damages the oracle rather than the output. Anything added
+/// to this pattern must be justified against that.
+static ID_CANDIDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[a-zA-Z0-9_]+-[a-zA-Z0-9]{3,}\b").expect("id candidate regex")
+});
+
+/// Issue-ID prefixes this suite actually mints.
+///
+/// The harness appends `--prefix bd` to every `create`/`q` (see
+/// `apply_default_test_prefix_shim`), so `bd-` is the only prefix that
+/// reaches a text snapshot. Tokens with any other prefix are redacted only
+/// when their suffix carries a digit (see [`looks_like_issue_id`]).
+///
+/// If a fixture ever mints a different prefix AND draws an all-letter hash,
+/// the raw ID reaches the snapshot and the test fails loudly on the next
+/// run. That is the intended failure mode: a visibly unstable snapshot says
+/// "add your prefix here", whereas the old catch-all silently ate English.
+const KNOWN_TEST_ID_PREFIXES: &[&str] = &["bd"];
+
+/// Whether a `prefix-suffix` token is an issue ID rather than a hyphenated
+/// English word or a CLI flag.
+///
+/// Mirrors the product's own `is_likely_hash_segment` (`src/util/id.rs`):
+/// IDs are `<prefix>-<base36 hash>`, hashes are lowercase base36, and a hash
+/// of 4+ characters always contains a digit — the generator enforces that
+/// precisely to avoid colliding with words. Three-character hashes may be
+/// all letters (`bd-abc`), so for those the prefix must be one we mint.
+fn looks_like_issue_id(token: &str) -> bool {
+    let Some((prefix, hash)) = token.rsplit_once('-') else {
+        return false;
+    };
+    if hash.len() < 3
+        || !hash
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return false;
+    }
+    KNOWN_TEST_ID_PREFIXES.contains(&prefix) || hash.chars().any(|c| c.is_ascii_digit())
+}
 static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
         .expect("full timestamp regex")
@@ -79,8 +131,18 @@ static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
+/// A backslash together with the character it precedes.
+///
+/// Captured as a pair so the replacement can spare `\[` and `\]`: those are
+/// not path separators, they are the signature of a markup escape that
+/// reached a sink which does not parse markup (`br show` shipped
+/// `use \[bold] for headings` for a body reading `use [bold] for headings`).
+/// Blanket-rewriting every backslash to `/` turned that artifact into a
+/// plausible-looking `/[bold]` on its way into the recorded value — damage
+/// disguised as normalization. Leave the backslash visible so a reviewer
+/// sees it and `snapshot_hygiene` can fail on it.
 static PATH_SEP_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\").expect("path separator regex"));
+    LazyLock::new(|| Regex::new(r"\\(.)").expect("path separator regex"));
 static TRAILING_WS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[ \t]+$").expect("trailing whitespace regex"));
 static MULTIPLE_BLANK_RE: LazyLock<Regex> =
@@ -413,10 +475,20 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("ansi_codes".to_string());
     }
 
-    // 3. Normalize path separators (Windows → Unix)
+    // 3. Normalize path separators (Windows → Unix), sparing `\[`/`\]`.
     if config.normalize_paths && normalized.contains('\\') {
-        normalized = PATH_SEP_RE.replace_all(&normalized, "/").to_string();
-        log.push("path_separators".to_string());
+        let replaced = PATH_SEP_RE.replace_all(&normalized, |caps: &regex::Captures<'_>| {
+            let next = &caps[1];
+            if next == "[" || next == "]" {
+                format!("\\{next}")
+            } else {
+                format!("/{next}")
+            }
+        });
+        if replaced != normalized {
+            normalized = replaced.into_owned();
+            log.push("path_separators".to_string());
+        }
     }
 
     // 4. Mask home directory paths
@@ -437,10 +509,10 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("temp_paths".to_string());
     }
 
-    // 6. Mask git hashes (must run BEFORE issue-ID redaction below: the
-    // generic `[a-zA-Z0-9_-]+-[a-z0-9]{3,}` issue-ID pattern would
-    // otherwise mistake a branch name like `feat-testclean` for an issue
-    // ID and mangle it before this pass ever sees it).
+    // 6. Mask git hashes. This runs before issue-ID redaction only because
+    // `(branch@hash)` is a shape of its own; the redaction pass below no
+    // longer mistakes a branch name like `feat-testclean` for an ID (its
+    // suffix carries no digit), but the dedicated placeholder is clearer.
     if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
         normalized = VERSION_RE
             .replace_all(&normalized, "(BRANCH@GIT_HASH)")
@@ -448,10 +520,23 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("git_hashes".to_string());
     }
 
-    // 7. Redact issue IDs
-    if config.redact_ids && ID_RE.is_match(&normalized) {
-        normalized = ID_RE.replace_all(&normalized, "ID-REDACTED").to_string();
-        log.push("issue_ids".to_string());
+    // 7. Redact issue IDs. `ID_CANDIDATE_RE` over-matches on purpose;
+    // `looks_like_issue_id` is what decides, so that a hyphenated word or a
+    // CLI flag is left intact instead of being replaced by a placeholder
+    // that no later reviewer can undo.
+    if config.redact_ids {
+        let replaced = ID_CANDIDATE_RE.replace_all(&normalized, |caps: &regex::Captures<'_>| {
+            let token = &caps[0];
+            if looks_like_issue_id(token) {
+                "ID-REDACTED".to_string()
+            } else {
+                token.to_string()
+            }
+        });
+        if replaced != normalized {
+            normalized = replaced.into_owned();
+            log.push("issue_ids".to_string());
+        }
     }
 
     // 8. Mask full timestamps
@@ -746,6 +831,93 @@ mod golden_snapshot_tests {
         assert!(snapshot.normalized.contains("ID-REDACTED"));
         assert!(!snapshot.normalized.contains("bd-abc123"));
         assert!(!snapshot.normalized.contains("beads_rust-xyz789"));
+    }
+
+    /// The redactor must not eat text that is not an ID.
+    ///
+    /// EVERY other test in this module asserts that a volatile value IS
+    /// masked; not one asserted that a stable value is NOT. That asymmetry is
+    /// why the old catch-all pattern survived: it was only ever observed
+    /// passing. It replaced `--dry-run`, `--external-ref`, `--no-color`,
+    /// `parent-child`, `auto-discover` and `Auto-import` with `ID-REDACTED`
+    /// on the way into `create_help.snap`, `help_output.snap` and three
+    /// error snapshots, so those recordings could not have failed if the
+    /// flags they document had been renamed.
+    ///
+    /// Each string below is real text from `br --help`, `br create --help`
+    /// or a `beads_rust::sync` log line that the recorded snapshots lost.
+    #[test]
+    fn test_redaction_preserves_hyphenated_words_and_flag_names() {
+        for stable in [
+            "--dry-run",
+            "--no-color",
+            "--external-ref <EXTERNAL_REF>",
+            "Parent issue ID (creates parent-child dep)",
+            "Database path (auto-discover .beads/*.db if not set)",
+            "Agent-first issue tracker (SQLite + JSONL)",
+            "Read or append an issue's comments (append-only attributed history)",
+            "Power-user / diagnostic commands",
+            "Auto-import completed imported_count=0",
+            "Auto-flush: exporting dirty issues",
+            "Auto-flush complete exported=1",
+        ] {
+            let normalized = normalize_output(stable);
+            assert_eq!(
+                normalized, stable,
+                "the redactor altered text that is not an issue ID; a snapshot \
+                 recorded from this can no longer fail when the text changes"
+            );
+        }
+    }
+
+    /// The inverse guard: tightening the rule until it stops eating English
+    /// can trivially be overshot into redacting nothing, and that failure
+    /// would surface much later as an unstable snapshot blamed on something
+    /// else. Every shape the harness actually mints must still be masked.
+    #[test]
+    fn test_redaction_still_masks_real_issue_ids() {
+        for (input, must_not_contain) in [
+            // The harness mints `bd-<3-char base36>`; all-letter draws are
+            // ~38% of the space, so both must go.
+            ("Created bd-2p7: a title", "bd-2p7"),
+            ("Created bd-abc: a title", "bd-abc"),
+            ("Issue not found: bd-nonexistent", "bd-nonexistent"),
+            // Longer hashes always carry a digit (src/util/id.rs), which is
+            // what lets an unknown prefix still be recognised.
+            ("Issue bd-abc123 depends on beads_rust-xyz789", "bd-abc123"),
+            ("Issue bd-abc123 depends on beads_rust-xyz789", "beads_rust-xyz789"),
+            ("Cycle detected: bd-1af -> bd-3m9", "bd-1af"),
+        ] {
+            let normalized = normalize_output(input);
+            assert!(
+                !normalized.contains(must_not_contain),
+                "{must_not_contain:?} survived redaction in {normalized:?} \
+                 \u{2014} a live issue ID in a snapshot makes it unstable"
+            );
+            assert!(
+                normalized.contains("ID-REDACTED"),
+                "expected a redaction placeholder in {normalized:?}"
+            );
+        }
+    }
+
+    /// Path normalization must not disguise a markup-escape artifact.
+    ///
+    /// `br show` shipped `use \[bold] for headings` for a stored body of
+    /// `use [bold] for headings`. Blanket backslash-to-slash rewriting would
+    /// have recorded that as `use /[bold] for headings` — still wrong, but
+    /// now shaped like a path, which is exactly the disguise that gets a bad
+    /// value waved through review. The backslash must reach the recorded
+    /// value so a human (and `tests/snapshot_hygiene.rs`) can see it.
+    #[test]
+    fn test_path_normalization_preserves_escaped_brackets() {
+        let escaped = r"use \[bold] for headings and \[red\]for errors";
+        let normalized = normalize_output(escaped);
+        assert_eq!(
+            normalized, escaped,
+            "a markup escape must survive normalization intact so it can be \
+             recognised as corruption rather than as a Windows path"
+        );
     }
 
     #[test]
