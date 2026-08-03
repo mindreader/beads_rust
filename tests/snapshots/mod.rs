@@ -1,3 +1,57 @@
+//! Recorded-output ("golden"/snapshot) tests for the `br` CLI.
+//!
+//! READ THIS BEFORE RE-RECORDING ANYTHING.
+//!
+//! A snapshot test knows exactly one thing: whether output CHANGED. It knows
+//! nothing about whether output is CORRECT. Whatever was in the buffer on the
+//! day someone ran `cargo insta accept` becomes ground truth, and every run
+//! afterwards defends it — including any defect it happened to contain. So a
+//! green snapshot suite is not evidence that the output is right; it is
+//! evidence that the output is the same as it was.
+//!
+//! That is not hypothetical here. `cli_output__search_output.snap` once
+//! recorded a `br search` line with its `[task]` type badge missing and the
+//! title truncated, because the console-markup parser was eating bracketed
+//! text. The test passed for the entire life of the bug, and it FAILED the
+//! fix: restoring the badge changed the bytes. The obvious response —
+//! re-record — would have enshrined the corruption a second time.
+//!
+//! WHAT `cargo insta accept` PROVES: that the new bytes are the bytes the
+//! code currently emits. WHAT IT DOES NOT PROVE: that those bytes are right.
+//! When a snapshot fails, the question is never "does the code still produce
+//! the old value?" but "which of these two values SHOULD the command print?"
+//! — and the answer has to come from the command's intent, not from the diff.
+//!
+//! CONVENTIONS THIS MODULE FOLLOWS, each of which exists because it was
+//! violated:
+//!
+//! 1. A recorded value must be reviewable as CORRECT ON ITS FACE. If reading
+//!    the `.snap` cannot tell you whether the command behaved, the fixture is
+//!    too thin — see `snapshot_show_output`, which asserted a description
+//!    render path with an issue that had no description.
+//!
+//! 2. An empty or trivially-satisfiable value must be EARNED. `[]`, `0` and a
+//!    zero-byte file are what a command prints when it works and also when it
+//!    is completely broken. Either populate the fixture so the empty answer
+//!    comes from filtering, or compose the value with its surrounding facts
+//!    (`compose_invocation`). `tests/snapshot_hygiene.rs` enforces this.
+//!
+//! 3. THE NORMALIZER IS PART OF THE ORACLE. Everything here passes through
+//!    `normalize_output`/`normalize_json` before being recorded, so an
+//!    over-broad masking rule destroys content BEFORE it reaches the expected
+//!    value — and unlike a rendering bug, nothing downstream can ever detect
+//!    it. A blanket `\w+-[a-z0-9]{3,}` ID rule silently rewrote `--dry-run`,
+//!    `--external-ref` and `Auto-import` as `ID-REDACTED`, leaving
+//!    `create_help.snap` unable to notice a rename of the flags it exists to
+//!    document. Any masking rule added here needs a test that it does NOT eat
+//!    ordinary text (see `test_redaction_preserves_hyphenated_words_and_flag_names`)
+//!    as well as one that it still masks what it is for.
+//!
+//! 4. Structural invariants over the corpus live in
+//!    `tests/snapshot_hygiene.rs`. They catch the corruption class without
+//!    needing to be re-recorded when output legitimately changes, which is
+//!    the only thing here that can catch a FUTURE corruption.
+
 #![allow(clippy::module_name_repetitions, clippy::trivial_regex, dead_code)]
 
 #[path = "../common/mod.rs"]
