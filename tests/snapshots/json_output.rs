@@ -296,7 +296,11 @@ fn snapshot_stale_json() {
 #[test]
 fn snapshot_orphans_json() {
     let workspace = init_workspace();
-    let id = create_issue(&workspace, "Issue left open after a commit", "create_orphan");
+    let id = create_issue(
+        &workspace,
+        "Issue left open after a commit",
+        "create_orphan",
+    );
 
     git_init(&workspace);
     git_commit(&workspace, &format!("fix({id}): close the login hole"));

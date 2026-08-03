@@ -37,8 +37,10 @@ pub fn git_init(workspace: &BrWorkspace) {
             .args(args)
             .current_dir(&workspace.root)
             .output()
-            .expect("git must be available: fixtures that need a repository \
-                     cannot silently degrade to an empty result");
+            .expect(
+                "git must be available: fixtures that need a repository \
+                     cannot silently degrade to an empty result",
+            );
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
@@ -108,9 +110,8 @@ static ANSI_RE: LazyLock<Regex> =
 /// an over-broad rule here is worse than an over-broad rule anywhere else in
 /// the suite: it damages the oracle rather than the output. Anything added
 /// to this pattern must be justified against that.
-static ID_CANDIDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[a-zA-Z0-9_]+-[a-zA-Z0-9]{3,}\b").expect("id candidate regex")
-});
+static ID_CANDIDATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9_]+-[a-zA-Z0-9]{3,}\b").expect("id candidate regex"));
 
 /// Issue-ID prefixes this suite actually mints.
 ///
@@ -1007,7 +1008,10 @@ mod golden_snapshot_tests {
             // Longer hashes always carry a digit (src/util/id.rs), which is
             // what lets an unknown prefix still be recognised.
             ("Issue bd-abc123 depends on beads_rust-xyz789", "bd-abc123"),
-            ("Issue bd-abc123 depends on beads_rust-xyz789", "beads_rust-xyz789"),
+            (
+                "Issue bd-abc123 depends on beads_rust-xyz789",
+                "beads_rust-xyz789",
+            ),
             ("Cycle detected: bd-1af -> bd-3m9", "bd-1af"),
         ] {
             let normalized = normalize_output(input);
