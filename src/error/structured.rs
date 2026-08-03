@@ -40,6 +40,8 @@ pub enum ErrorCode {
     SchemaMismatch,
     /// Database operation failed
     DatabaseError,
+    /// The stored value is not the value bd was asked to store
+    WriteMismatch,
     /// Beads workspace not initialized
     NotInitialized,
     /// Already initialized
@@ -127,6 +129,7 @@ impl ErrorCode {
             Self::DatabaseNotFound => "DATABASE_NOT_FOUND",
             Self::DatabaseLocked => "DATABASE_LOCKED",
             Self::SchemaMismatch => "SCHEMA_MISMATCH",
+            Self::WriteMismatch => "WRITE_MISMATCH",
             Self::DatabaseError => "DATABASE_ERROR",
             Self::NotInitialized => "NOT_INITIALIZED",
             Self::AlreadyInitialized => "ALREADY_INITIALIZED",
@@ -208,6 +211,7 @@ impl ErrorCode {
             | Self::DatabaseLocked
             | Self::SchemaMismatch
             | Self::DatabaseError
+            | Self::WriteMismatch
             | Self::NotInitialized
             | Self::AlreadyInitialized => 2,
             // Issue / Operational (3)
@@ -551,6 +555,21 @@ impl StructuredError {
                     "append_alternative": "br comments add",
                 })),
             ),
+            BeadsError::WriteDidNotLandAsSent {
+                id,
+                field,
+                requested_chars,
+                stored_chars,
+            } => (
+                ErrorCode::WriteMismatch,
+                Some(json!({
+                    "id": id,
+                    "field": field,
+                    "requested_chars": requested_chars,
+                    "stored_chars": stored_chars,
+                    "landed_as_sent": false,
+                })),
+            ),
             BeadsError::InvalidStatus { status } => (
                 ErrorCode::InvalidStatus,
                 Some(serde_json::json!({
@@ -659,6 +678,24 @@ impl StructuredError {
                  use 'br comments add {id} -f <file>' (append-only, attributed, timestamped) \
                  or re-send {flag} with the existing text included. \
                  To replace it anyway, re-run the same command with {REPLACE_FLAG}."
+            ));
+        }
+
+        // The write already happened, so this hint cannot offer a way to
+        // prevent it — only a way to find out what is now in the field.
+        if let BeadsError::WriteDidNotLandAsSent {
+            id,
+            field,
+            requested_chars,
+            stored_chars,
+        } = err
+        {
+            return Some(format!(
+                "bd stored {stored_chars} chars of the {requested_chars} it was handed for \
+                 {field}, so the write landed altered. The value bd RECEIVED is what it \
+                 compared against, so this is a discrepancy inside bd, not in your shell. \
+                 Read the field back in full with 'br show {id} --json' before re-sending, \
+                 and do not treat the update as applied."
             ));
         }
 

@@ -124,6 +124,27 @@ pub enum BeadsError {
         new_chars: usize,
     },
 
+    /// The stored value is not the value bd was asked to store.
+    ///
+    /// Raised AFTER the write, because that is the earliest moment it can be
+    /// observed. bd compares the value it received on the command line with
+    /// the value it reads back, so this reports an alteration inside bd — a
+    /// caller whose own shell mangled the payload before bd saw it produces a
+    /// perfectly consistent write and is not detectable here.
+    #[error(
+        "Write did not land as sent: {field} on {id} was given {requested_chars} chars but stores {stored_chars}"
+    )]
+    WriteDidNotLandAsSent {
+        /// Issue that was written.
+        id: String,
+        /// Field name (e.g. `notes`).
+        field: String,
+        /// Size of the value bd was asked to store, in chars.
+        requested_chars: usize,
+        /// Size of the value bd actually stored, in chars.
+        stored_chars: usize,
+    },
+
     /// Invalid status value.
     #[error("Invalid status: {status}")]
     InvalidStatus { status: String },

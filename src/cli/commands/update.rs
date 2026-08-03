@@ -43,15 +43,33 @@ struct TextDeltaOutput {
     /// shrink guard cannot see.
     #[serde(skip_serializing_if = "Option::is_none")]
     prior_content_retained: Option<bool>,
+    /// Size of the value bd was ASKED to write.
+    ///
+    /// Present only when it differs from `new_chars`, i.e. only when the write
+    /// did not land as sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_chars: Option<usize>,
+    /// Whether what is stored is what bd was asked to store.
+    ///
+    /// Emitted only when it is `false`, so its mere presence is the alarm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landed_as_sent: Option<bool>,
 }
 
 impl From<&TextChange> for TextDeltaOutput {
     fn from(change: &TextChange) -> Self {
+        let mismatch = change.landed_as_sent == Some(false);
         Self {
             field: change.field.name(),
             old_chars: change.old_chars,
             new_chars: change.new_chars,
             prior_content_retained: change.prior_retained,
+            requested_chars: if mismatch {
+                change.requested_chars
+            } else {
+                None
+            },
+            landed_as_sent: if mismatch { Some(false) } else { None },
         }
     }
 }
@@ -121,6 +139,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         || args.parent.is_some();
 
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
+    let mut write_mismatch: Option<BeadsError> = None;
 
     let storage = &mut storage_ctx.storage;
 
@@ -202,6 +221,20 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         if let Some(issue) = issue_after {
             let text_changes =
                 measure_text_changes(id, &text_writes, issue_before.as_ref(), &issue);
+            // Remember the first write that did not land as sent. Reported
+            // AFTER the output below, so the caller still sees exactly what
+            // happened to every field, and then exits non-zero.
+            if write_mismatch.is_none() {
+                write_mismatch = text_changes
+                    .iter()
+                    .find(|change| change.landed_as_sent == Some(false))
+                    .map(|change| BeadsError::WriteDidNotLandAsSent {
+                        id: id.clone(),
+                        field: change.field.name().to_string(),
+                        requested_chars: change.requested_chars.unwrap_or(change.new_chars),
+                        stored_chars: change.new_chars,
+                    });
+            }
             if ctx.is_json() {
                 updated_issues.push(UpdatedIssueOutput::new(
                     &issue,
@@ -226,6 +259,15 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
+
+    // A write that did not land as sent has already happened and cannot be
+    // refused, but a caller running `br update ... && next-step` must not
+    // proceed as though it applied. Distinct exit code (2) from the
+    // DESTRUCTIVE_UPDATE refusal (4) so automation can tell the two apart.
+    if let Some(mismatch) = write_mismatch {
+        return Err(mismatch);
+    }
+
     Ok(())
 }
 
@@ -437,22 +479,39 @@ fn measure_text_changes(
     };
     writes
         .iter()
-        .map(|&(field, _)| {
-            TextChange::measure(field, stored_text(before, field), stored_text(after, field))
+        .map(|&(field, requested)| {
+            TextChange::measure_write(
+                field,
+                stored_text(before, field),
+                stored_text(after, field),
+                requested,
+            )
         })
         .collect()
 }
 
 /// Render one field's delta for the success line.
 ///
-/// The retention verdict is shouted only when prior content was NOT retained,
-/// because that is the case a reader must not skim past.
+/// Ordering is deliberate. A discrepancy comes FIRST, ahead of the sizes and
+/// ahead of any reassuring clause, because a reader scanning the line must hit
+/// the alarm before the comfort. And when the write did not land as sent, the
+/// retention verdict is omitted entirely: "prior content retained" is a true
+/// answer to a question the caller has stopped caring about, and printing it
+/// beside a failure is how a line becomes noise.
 fn format_text_change(change: &TextChange) -> String {
+    let name = change.field.name();
+    if change.landed_as_sent == Some(false) {
+        let requested = change.requested_chars.unwrap_or(change.new_chars);
+        return format!(
+            "{name}: WRITE DID NOT LAND AS SENT, requested {requested} chars, stored {} \
+             ({} \u{2192} {} chars)",
+            change.new_chars, change.old_chars, change.new_chars
+        );
+    }
+
     let mut rendered = format!(
-        "{}: {} \u{2192} {} chars",
-        change.field.name(),
-        change.old_chars,
-        change.new_chars
+        "{name}: {} \u{2192} {} chars",
+        change.old_chars, change.new_chars
     );
     match change.prior_retained {
         Some(true) => rendered.push_str(", prior content retained"),
@@ -473,7 +532,16 @@ fn print_update_summary(
     if text_changes.is_empty() {
         println!("Updated {id}: {title}");
     } else {
-        let deltas: Vec<String> = text_changes.iter().map(format_text_change).collect();
+        // Any field whose write did not land as sent is rendered first, so a
+        // multi-field update cannot bury the alarm behind two healthy deltas.
+        let (alarming, ordinary): (Vec<&TextChange>, Vec<&TextChange>) = text_changes
+            .iter()
+            .partition(|change| change.landed_as_sent == Some(false));
+        let deltas: Vec<String> = alarming
+            .into_iter()
+            .chain(ordinary)
+            .map(format_text_change)
+            .collect();
         println!("Updated {id}: {title}  ({})", deltas.join("; "));
     }
 

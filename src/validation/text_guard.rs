@@ -32,6 +32,15 @@
 //!    current state, and legitimately rewording that state produces a value
 //!    that does not contain the old one. It is high-signal as reporting and
 //!    unusable as a gate.
+//!
+//! 3. [`TextChange::landed_as_sent`] — after the write, whether what is now
+//!    stored is what bd was asked to store. Found by mutation-testing the
+//!    write path: with a write that truncated its input, a 5-char field
+//!    handed 16 chars reported `5 -> 5 chars, prior content retained` and
+//!    exited 0. Every word of that was true and the caller's new content was
+//!    gone. bd holds both the requested value and the stored result, so this
+//!    comparison is free; it is reporting only, because the write has already
+//!    happened by the time it can be made.
 
 /// A free-text field that `br update` can set wholesale.
 ///
@@ -105,6 +114,17 @@ pub struct TextChange {
     ///
     /// `None` when the old value had no content to retain.
     pub prior_retained: Option<bool>,
+    /// Size of the value bd was ASKED to store, when that is known.
+    ///
+    /// `None` before the write, where the requested value and the new value
+    /// are the same thing.
+    pub requested_chars: Option<usize>,
+    /// Whether the stored value equals the value bd was asked to store.
+    ///
+    /// `None` before the write. `Some(false)` means the write did not land as
+    /// sent — the caller's content was altered or dropped between the command
+    /// line and the database.
+    pub landed_as_sent: Option<bool>,
 }
 
 impl TextChange {
@@ -125,6 +145,23 @@ impl TextChange {
             } else {
                 None
             },
+            requested_chars: None,
+            landed_as_sent: None,
+        }
+    }
+
+    /// Measure a write that has already happened.
+    ///
+    /// `stored` is what the database now holds; `requested` is what bd was
+    /// asked to store. They differ when something between the command line and
+    /// the row altered the value, which the size delta alone can report as a
+    /// perfectly healthy no-op.
+    #[must_use]
+    pub fn measure_write(field: TextField, old: &str, stored: &str, requested: &str) -> Self {
+        Self {
+            requested_chars: Some(requested.chars().count()),
+            landed_as_sent: Some(stored == requested),
+            ..Self::measure(field, old, stored)
         }
     }
 
@@ -234,6 +271,39 @@ mod tests {
         assert_eq!(change.old_chars, 4);
         assert_eq!(change.new_chars, 3);
         assert!(change.is_destructive_shrink());
+    }
+
+    #[test]
+    fn a_write_that_landed_verbatim_is_reported_as_such() {
+        let change = TextChange::measure_write(TextField::Notes, "abcde", "abcdefg", "abcdefg");
+        assert_eq!(change.landed_as_sent, Some(true));
+        assert_eq!(change.requested_chars, Some(7));
+    }
+
+    #[test]
+    fn a_write_that_did_not_land_as_sent_is_visible() {
+        // Mutation-test finding: the write path truncated its input, so the
+        // field neither shrank nor lost prior content, and 11 of the caller's
+        // characters silently never arrived. Sizes alone call this healthy.
+        let change = TextChange::measure_write(
+            TextField::Notes,
+            "abcde",
+            "abcde",
+            "abcdefghijKLMNOP",
+        );
+        assert!(!change.is_destructive_shrink());
+        assert_eq!(change.prior_retained, Some(true));
+        assert_eq!(change.old_chars, 5);
+        assert_eq!(change.new_chars, 5);
+        assert_eq!(change.landed_as_sent, Some(false));
+        assert_eq!(change.requested_chars, Some(16));
+    }
+
+    #[test]
+    fn pre_write_measurements_make_no_claim_about_landing() {
+        let change = measure("abcde", "abcdefg");
+        assert_eq!(change.landed_as_sent, None);
+        assert_eq!(change.requested_chars, None);
     }
 
     #[test]

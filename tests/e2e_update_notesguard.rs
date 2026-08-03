@@ -109,6 +109,71 @@ fn seed_notes(workspace: &BrWorkspace, id: &str, text: &str) {
 }
 
 // =============================================================================
+// Does the storage layer normalize? (measured, not assumed)
+// =============================================================================
+
+/// EMPIRICAL PRECONDITION for the "write did not land as sent" report.
+///
+/// That report compares the value bd was handed against the value bd stored,
+/// which is only meaningful if the storage layer stores free text verbatim.
+/// If anything trimmed a trailing newline, folded CRLF, collapsed whitespace
+/// or NFC-normalized, the comparison would fire on ordinary correct writes
+/// and the whole delta line would be trained into background noise within a
+/// week.
+///
+/// So it is measured here rather than assumed, over the transformations a
+/// storage or serde layer performs in passing, and the result is pinned: a
+/// later well-meaning normalization has to fail this test before it can make
+/// the mismatch report lie.
+///
+/// NUL bytes are not covered — they cannot be passed through argv at all, so
+/// no caller can reach the field with one.
+#[test]
+fn storage_stores_free_text_verbatim() {
+    common::init_test_logging();
+    let payloads = [
+        ("trailing newline", "body of the note\n"),
+        ("several trailing newlines", "body of the note\n\n\n"),
+        ("leading newline", "\nbody of the note"),
+        ("crlf line endings", "first line\r\nsecond line\r\n"),
+        ("surrounding spaces", "   body of the note   "),
+        ("internal runs of spaces", "a     b\t\tc"),
+        // Combining acute vs precomposed: identical to a reader, different
+        // bytes. NFC normalization anywhere would collapse the first to the
+        // second.
+        ("decomposed grapheme", "cafe\u{301} au lait"),
+        ("precomposed grapheme", "caf\u{e9} au lait"),
+        ("astral plane", "rocket \u{1f680} and flag \u{1f1f3}\u{1f1f4}"),
+        ("quotes and backslashes", "a \"quoted\" \\ path"),
+    ];
+
+    let mut checked = 0_usize;
+    for (label, payload) in payloads {
+        let (workspace, id) = workspace_with_issue("verbatim storage probe");
+        let out = run_br(&workspace, ["update", &id, "--notes", payload], label);
+        assert!(out.status.success(), "{label} write failed: {}", out.stderr);
+
+        let stored = stored_field(&workspace, &id, "notes");
+        assert_eq!(
+            stored.as_bytes(),
+            payload.as_bytes(),
+            "{label}: storage altered the value; the landed-as-sent report \
+             would fire on ordinary writes and must be compared against the \
+             post-normalization value instead"
+        );
+        checked += 1;
+    }
+
+    // Count the comparisons that actually ran. A loop that silently iterated
+    // zero times reports exactly like a loop where nothing failed.
+    assert_eq!(
+        checked,
+        payloads.len(),
+        "not every payload was checked: an absent check is not a passing one"
+    );
+}
+
+// =============================================================================
 // Part 1 — the refusal
 // =============================================================================
 
