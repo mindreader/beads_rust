@@ -48,7 +48,11 @@ fn workspace_with_issue(title: &str) -> (BrWorkspace, String) {
     let create = run_br(&workspace, ["create", title], "create");
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let id = parse_created_id(&create.stdout);
-    assert!(!id.is_empty(), "could not parse id from {:?}", create.stdout);
+    assert!(
+        !id.is_empty(),
+        "could not parse id from {:?}",
+        create.stdout
+    );
     (workspace, id)
 }
 
@@ -92,8 +96,7 @@ fn structured_error(stderr: &str) -> Value {
     let start = stderr.find('{').unwrap_or_else(|| {
         panic!("no JSON error envelope in stderr: {stderr}");
     });
-    let envelope: Value =
-        serde_json::from_str(&stderr[start..]).expect("structured error json");
+    let envelope: Value = serde_json::from_str(&stderr[start..]).expect("structured error json");
     let inner = envelope["error"].clone();
     assert!(
         inner.is_object(),
@@ -143,7 +146,10 @@ fn storage_stores_free_text_verbatim() {
         // second.
         ("decomposed grapheme", "cafe\u{301} au lait"),
         ("precomposed grapheme", "caf\u{e9} au lait"),
-        ("astral plane", "rocket \u{1f680} and flag \u{1f1f3}\u{1f1f4}"),
+        (
+            "astral plane",
+            "rocket \u{1f680} and flag \u{1f1f3}\u{1f1f4}",
+        ),
         ("quotes and backslashes", "a \"quoted\" \\ path"),
     ];
 
@@ -291,7 +297,11 @@ fn every_free_text_field_is_gated() {
     for (flag, field) in cases {
         let (workspace, id) = workspace_with_issue("field coverage probe");
         let seed = run_br(&workspace, ["update", &id, flag, BLOCK_ONE], "seed");
-        assert!(seed.status.success(), "seeding {field} failed: {}", seed.stderr);
+        assert!(
+            seed.status.success(),
+            "seeding {field} failed: {}",
+            seed.stderr
+        );
         assert_eq!(stored_field(&workspace, &id, field), BLOCK_ONE);
 
         let out = run_br(&workspace, ["update", &id, flag, BLOCK_TWO], "shrink");
@@ -373,7 +383,11 @@ fn replace_flag_allows_the_shrink() {
         "replace",
     );
 
-    assert!(out.status.success(), "--replace should proceed: {}", out.stderr);
+    assert!(
+        out.status.success(),
+        "--replace should proceed: {}",
+        out.stderr
+    );
     assert_eq!(stored_field(&workspace, &id, "notes"), BLOCK_TWO);
     assert!(
         out.stdout.contains("notes: 62 \u{2192} 27 chars"),
@@ -485,7 +499,11 @@ fn growth_is_allowed() {
 
     let out = run_br(&workspace, ["update", &id, "--notes", &grown], "grow");
 
-    assert!(out.status.success(), "growth must be allowed: {}", out.stderr);
+    assert!(
+        out.status.success(),
+        "growth must be allowed: {}",
+        out.stderr
+    );
     assert_eq!(stored_field(&workspace, &id, "notes"), grown);
 }
 
@@ -500,7 +518,11 @@ fn same_size_rewrite_is_allowed_but_flagged() {
 
     let out = run_br(&workspace, ["update", &id, "--notes", "bbbbbbbbbb"], "same");
 
-    assert!(out.status.success(), "same-size write must be allowed: {}", out.stderr);
+    assert!(
+        out.status.success(),
+        "same-size write must be allowed: {}",
+        out.stderr
+    );
     assert!(
         out.stdout.contains("PRIOR CONTENT NOT RETAINED"),
         "a same-size rewrite drops content and must say so: {}",

@@ -1258,7 +1258,10 @@ mod tests {
         let hint = err.hint.as_deref().expect("hint");
         assert!(hint.contains("inside bd"), "{hint}");
         assert!(hint.contains("br show np-3pp --json"), "{hint}");
-        assert!(hint.contains("do not treat the update as applied"), "{hint}");
+        assert!(
+            hint.contains("do not treat the update as applied"),
+            "{hint}"
+        );
     }
 
     #[test]

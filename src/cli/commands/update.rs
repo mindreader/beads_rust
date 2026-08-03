@@ -67,7 +67,11 @@ impl From<&TextChange> for TextDeltaOutput {
             // the human line: "prior content retained" is a true answer to a
             // question the caller has stopped caring about, and next to a
             // failure it reads as reassurance.
-            prior_content_retained: if mismatch { None } else { change.prior_retained },
+            prior_content_retained: if mismatch {
+                None
+            } else {
+                change.prior_retained
+            },
             requested_chars: if mismatch {
                 change.requested_chars
             } else {
@@ -132,7 +136,12 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // both the old value and the incoming one without a subprocess, so the
     // read happens here rather than being taken on trust from the caller.
     let text_writes = requested_text_writes(args);
-    refuse_destructive_shrinks(&storage_ctx.storage, &resolved_ids, &text_writes, args.replace)?;
+    refuse_destructive_shrinks(
+        &storage_ctx.storage,
+        &resolved_ids,
+        &text_writes,
+        args.replace,
+    )?;
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
@@ -176,9 +185,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
 
         // Warn if the target status matches the current status (redundant transition)
-        if let (Some(issue_before), Some(target_status)) =
-            (&issue_before, &update.status)
-        {
+        if let (Some(issue_before), Some(target_status)) = (&issue_before, &update.status) {
             if issue_before.status == *target_status {
                 warn_redundant_status(id, target_status, storage);
             }
@@ -189,29 +196,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             storage.update_issue(id, &update, &actor)?;
         }
 
-        // Apply labels
-        for label in &args.add_label {
-            LabelValidator::validate(label)
-                .map_err(|e| BeadsError::validation("label", e.message))?;
-            storage.add_label(id, label, &actor)?;
-        }
-        for label in &args.remove_label {
-            storage.remove_label(id, label, &actor)?;
-        }
-        if !args.set_labels.is_empty() {
-            // Remove all then add new
-            storage.remove_all_labels(id, &actor)?;
-            // Join all flag values, then split by comma (handles both --set-labels a,b and --set-labels a --set-labels b)
-            let combined = args.set_labels.join(",");
-            for label in combined.split(',') {
-                let label = label.trim();
-                if !label.is_empty() {
-                    LabelValidator::validate(label)
-                        .map_err(|e| BeadsError::validation("label", e.message))?;
-                    storage.add_label(id, label, &actor)?;
-                }
-            }
-        }
+        apply_label_updates(storage, id, args, &actor)?;
 
         // Apply parent
         apply_parent_update(storage, id, args.parent.as_deref(), &resolver, &actor)?;
@@ -225,36 +210,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         if let Some(issue) = issue_after {
             let text_changes =
                 measure_text_changes(id, &text_writes, issue_before.as_ref(), &issue);
-            // Remember the first write that did not land as sent. Reported
-            // AFTER the output below, so the caller still sees exactly what
-            // happened to every field, and then exits non-zero.
+            // Remember the FIRST write that did not land as sent; it is raised
+            // after every issue has reported, so the caller sees what happened
+            // to each field and then exits non-zero.
             if write_mismatch.is_none() {
-                write_mismatch = text_changes
-                    .iter()
-                    .find(|change| change.landed_as_sent == Some(false))
-                    .map(|change| BeadsError::WriteDidNotLandAsSent {
-                        id: id.clone(),
-                        field: change.field.name().to_string(),
-                        requested_chars: change.requested_chars.unwrap_or(change.new_chars),
-                        stored_chars: change.new_chars,
-                    });
+                write_mismatch = first_write_mismatch(id, &text_changes);
             }
-            if ctx.is_json() {
-                updated_issues.push(UpdatedIssueOutput::new(
-                    &issue,
-                    text_changes.iter().map(TextDeltaOutput::from).collect(),
-                ));
-            } else if has_updates {
-                print_update_summary(
-                    id,
-                    &issue.title,
-                    issue_before.as_ref(),
-                    &issue,
-                    &text_changes,
-                );
-            } else {
-                println!("No updates specified for {id}");
-            }
+            report_one_update(
+                id,
+                issue_before.as_ref(),
+                &issue,
+                &text_changes,
+                has_updates,
+                ctx,
+                &mut updated_issues,
+            );
         }
     }
 
@@ -492,6 +462,73 @@ fn measure_text_changes(
             )
         })
         .collect()
+}
+
+/// Apply `--add-label` / `--remove-label` / `--set-labels` to one issue.
+fn apply_label_updates(
+    storage: &mut SqliteStorage,
+    id: &str,
+    args: &UpdateArgs,
+    actor: &str,
+) -> Result<()> {
+    for label in &args.add_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+        storage.add_label(id, label, actor)?;
+    }
+    for label in &args.remove_label {
+        storage.remove_label(id, label, actor)?;
+    }
+    if !args.set_labels.is_empty() {
+        // Remove all then add new
+        storage.remove_all_labels(id, actor)?;
+        // Join all flag values, then split by comma (handles both
+        // --set-labels a,b and --set-labels a --set-labels b)
+        let combined = args.set_labels.join(",");
+        for label in combined.split(',') {
+            let label = label.trim();
+            if !label.is_empty() {
+                LabelValidator::validate(label)
+                    .map_err(|e| BeadsError::validation("label", e.message))?;
+                storage.add_label(id, label, actor)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first field whose stored value is not the value bd was asked to store.
+fn first_write_mismatch(id: &str, changes: &[TextChange]) -> Option<BeadsError> {
+    changes
+        .iter()
+        .find(|change| change.landed_as_sent == Some(false))
+        .map(|change| BeadsError::WriteDidNotLandAsSent {
+            id: id.to_string(),
+            field: change.field.name().to_string(),
+            requested_chars: change.requested_chars.unwrap_or(change.new_chars),
+            stored_chars: change.new_chars,
+        })
+}
+
+/// Emit one issue's result, into the JSON accumulator or straight to stdout.
+fn report_one_update(
+    id: &str,
+    before: Option<&Issue>,
+    after: &Issue,
+    text_changes: &[TextChange],
+    has_updates: bool,
+    ctx: &OutputContext,
+    json_out: &mut Vec<UpdatedIssueOutput>,
+) {
+    if ctx.is_json() {
+        json_out.push(UpdatedIssueOutput::new(
+            after,
+            text_changes.iter().map(TextDeltaOutput::from).collect(),
+        ));
+    } else if has_updates {
+        print_update_summary(id, &after.title, before, after, text_changes);
+    } else {
+        println!("No updates specified for {id}");
+    }
 }
 
 /// Render one field's delta for the success line.

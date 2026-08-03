@@ -285,12 +285,8 @@ mod tests {
         // Mutation-test finding: the write path truncated its input, so the
         // field neither shrank nor lost prior content, and 11 of the caller's
         // characters silently never arrived. Sizes alone call this healthy.
-        let change = TextChange::measure_write(
-            TextField::Notes,
-            "abcde",
-            "abcde",
-            "abcdefghijKLMNOP",
-        );
+        let change =
+            TextChange::measure_write(TextField::Notes, "abcde", "abcde", "abcdefghijKLMNOP");
         assert!(!change.is_destructive_shrink());
         assert_eq!(change.prior_retained, Some(true));
         assert_eq!(change.old_chars, 5);
