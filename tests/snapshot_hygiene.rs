@@ -17,7 +17,7 @@
 //! about SHAPE — a recorded value that is empty, unreferenced, or visibly
 //! mangled is wrong no matter what the command is. Anything that needs to
 //! know the intended text belongs in a semantic test
-//! (`tests/output_invariants.rs`, `tests/e2e_markup_escaping.rs`), not here.
+//! (`tests/e2e_markup_escaping.rs`), not here.
 //!
 //! WHAT RE-RECORDING PROVES. `cargo insta accept` proves that the new bytes
 //! are the bytes the code currently emits. It proves nothing about whether
