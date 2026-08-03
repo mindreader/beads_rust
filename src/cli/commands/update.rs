@@ -201,7 +201,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
         if let Some(issue) = issue_after {
             let text_changes =
-                measure_text_changes(&text_writes, issue_before.as_ref(), &issue);
+                measure_text_changes(id, &text_writes, issue_before.as_ref(), &issue);
             if ctx.is_json() {
                 updated_issues.push(UpdatedIssueOutput::new(
                     &issue,
@@ -387,9 +387,14 @@ fn refuse_destructive_shrinks(
     }
 
     for id in ids {
+        // FAIL CLOSED. If the stored value cannot be read there is nothing to
+        // compare against, and "the comparison did not happen" must never be
+        // reported as "the comparison passed" — that is the exact shape of the
+        // vacuous preservation checks this guard exists to replace. Ids are
+        // existence-checked during resolution, so this is not reachable by an
+        // ordinary caller; it stays a refusal rather than a skip anyway.
         let Some(issue) = storage.get_issue(id)? else {
-            // Nonexistent ids are reported by the normal update path.
-            continue;
+            return Err(BeadsError::IssueNotFound { id: id.clone() });
         };
         for &(field, new_value) in writes {
             let change = TextChange::measure(field, stored_text(&issue, field), new_value);
@@ -413,11 +418,21 @@ fn refuse_destructive_shrinks(
 /// Uses the stored before/after values rather than the arguments, so the
 /// reported numbers are the numbers in the database.
 fn measure_text_changes(
+    id: &str,
     writes: &[(TextField, &str)],
     before: Option<&Issue>,
     after: &Issue,
 ) -> Vec<TextChange> {
+    if writes.is_empty() {
+        return Vec::new();
+    }
     let Some(before) = before else {
+        // Say so out loud. A silently absent delta is indistinguishable from
+        // "no free-text field was written", which is the confusion this whole
+        // change exists to remove.
+        eprintln!(
+            "warning: {id} could not be read before the write; field size deltas unavailable"
+        );
         return Vec::new();
     };
     writes
