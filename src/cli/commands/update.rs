@@ -9,6 +9,7 @@ use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::IdResolver;
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
+use crate::validation::text_guard::{TextChange, TextField};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -20,16 +21,50 @@ struct UpdatedIssueOutput {
     status: String,
     priority: i32,
     updated_at: DateTime<Utc>,
+    /// Before/after sizes for every free-text field this command wrote.
+    ///
+    /// Emitted so an agent parsing JSON sees the same delta a human sees on
+    /// the success line; agents never read the human line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    text_deltas: Vec<TextDeltaOutput>,
 }
 
-impl From<&Issue> for UpdatedIssueOutput {
-    fn from(issue: &Issue) -> Self {
+/// JSON shape for one free-text field's before/after sizes.
+#[derive(Serialize)]
+struct TextDeltaOutput {
+    field: &'static str,
+    old_chars: usize,
+    new_chars: usize,
+    /// Whether the previous value survives verbatim inside the new one.
+    ///
+    /// Absent when there was no prior content to retain. `false` on a write
+    /// that GREW the field means the growth still dropped everything that was
+    /// there — the read-modify-write-with-a-failed-preimage case, which the
+    /// shrink guard cannot see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior_content_retained: Option<bool>,
+}
+
+impl From<&TextChange> for TextDeltaOutput {
+    fn from(change: &TextChange) -> Self {
+        Self {
+            field: change.field.name(),
+            old_chars: change.old_chars,
+            new_chars: change.new_chars,
+            prior_content_retained: change.prior_retained,
+        }
+    }
+}
+
+impl UpdatedIssueOutput {
+    fn new(issue: &Issue, text_deltas: Vec<TextDeltaOutput>) -> Self {
         Self {
             id: issue.id.clone(),
             title: issue.title.clone(),
             status: issue.status.as_str().to_string(),
             priority: issue.priority.0,
             updated_at: issue.updated_at,
+            text_deltas,
         }
     }
 }
@@ -69,6 +104,13 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ctx,
         );
     }
+
+    // Free-text writes are checked against the STORED value before anything
+    // is mutated, for every target id. bd is the only participant that holds
+    // both the old value and the incoming one without a subprocess, so the
+    // read happens here rather than being taken on trust from the caller.
+    let text_writes = requested_text_writes(args);
+    refuse_destructive_shrinks(&storage_ctx.storage, &resolved_ids, &text_writes, args.replace)?;
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
@@ -158,10 +200,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let issue_after = storage.get_issue(id)?;
 
         if let Some(issue) = issue_after {
+            let text_changes =
+                measure_text_changes(&text_writes, issue_before.as_ref(), &issue);
             if ctx.is_json() {
-                updated_issues.push(UpdatedIssueOutput::from(&issue));
+                updated_issues.push(UpdatedIssueOutput::new(
+                    &issue,
+                    text_changes.iter().map(TextDeltaOutput::from).collect(),
+                ));
             } else if has_updates {
-                print_update_summary(id, &issue.title, issue_before.as_ref(), &issue);
+                print_update_summary(
+                    id,
+                    &issue.title,
+                    issue_before.as_ref(),
+                    &issue,
+                    &text_changes,
+                );
             } else {
                 println!("No updates specified for {id}");
             }
@@ -275,9 +328,139 @@ fn execute_reprefix(
     Ok(())
 }
 
+/// The free-text field values this invocation asks to write, in CLI order.
+///
+/// Read from `args` rather than from the assembled `IssueUpdate` so the guard
+/// sees exactly what the caller passed, including an explicit empty string.
+fn requested_text_writes(args: &UpdateArgs) -> Vec<(TextField, &str)> {
+    let candidates = [
+        (TextField::Title, args.title.as_deref()),
+        (TextField::Description, args.description.as_deref()),
+        (TextField::Design, args.design.as_deref()),
+        (
+            TextField::AcceptanceCriteria,
+            args.acceptance_criteria.as_deref(),
+        ),
+        (TextField::Notes, args.notes.as_deref()),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(field, value)| value.map(|v| (field, v)))
+        .collect()
+}
+
+/// The currently stored value of a free-text field ("" when unset).
+fn stored_text(issue: &Issue, field: TextField) -> &str {
+    match field {
+        TextField::Title => issue.title.as_str(),
+        TextField::Description => issue.description.as_deref().unwrap_or_default(),
+        TextField::Design => issue.design.as_deref().unwrap_or_default(),
+        TextField::AcceptanceCriteria => issue.acceptance_criteria.as_deref().unwrap_or_default(),
+        TextField::Notes => issue.notes.as_deref().unwrap_or_default(),
+    }
+}
+
+/// Refuse, before any write happens, any update that would shrink a
+/// free-text field that currently has content.
+///
+/// This runs over EVERY target id up front: a multi-id update either applies
+/// everywhere or nowhere, rather than destroying the first issue and then
+/// reporting a refusal for the second.
+///
+/// The shrink test is a cheap proxy for destruction, not a proof of it — a
+/// write that GROWS the field can still drop everything that was there. That
+/// case is deliberately allowed and reported instead (see
+/// `crate::validation::text_guard`).
+///
+/// # Errors
+///
+/// Returns `BeadsError::DestructiveFieldShrink` for the first offending
+/// (issue, field) pair. Nothing has been written when it does.
+fn refuse_destructive_shrinks(
+    storage: &SqliteStorage,
+    ids: &[String],
+    writes: &[(TextField, &str)],
+    replace_opt_in: bool,
+) -> Result<()> {
+    if writes.is_empty() || replace_opt_in {
+        return Ok(());
+    }
+
+    for id in ids {
+        let Some(issue) = storage.get_issue(id)? else {
+            // Nonexistent ids are reported by the normal update path.
+            continue;
+        };
+        for &(field, new_value) in writes {
+            let change = TextChange::measure(field, stored_text(&issue, field), new_value);
+            if change.is_destructive_shrink() {
+                return Err(BeadsError::DestructiveFieldShrink {
+                    id: issue.id.clone(),
+                    field: field.name().to_string(),
+                    flag: field.flag().to_string(),
+                    old_chars: change.old_chars,
+                    new_chars: change.new_chars,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Measure what actually happened to each free-text field this command wrote.
+///
+/// Uses the stored before/after values rather than the arguments, so the
+/// reported numbers are the numbers in the database.
+fn measure_text_changes(
+    writes: &[(TextField, &str)],
+    before: Option<&Issue>,
+    after: &Issue,
+) -> Vec<TextChange> {
+    let Some(before) = before else {
+        return Vec::new();
+    };
+    writes
+        .iter()
+        .map(|&(field, _)| {
+            TextChange::measure(field, stored_text(before, field), stored_text(after, field))
+        })
+        .collect()
+}
+
+/// Render one field's delta for the success line.
+///
+/// The retention verdict is shouted only when prior content was NOT retained,
+/// because that is the case a reader must not skim past.
+fn format_text_change(change: &TextChange) -> String {
+    let mut rendered = format!(
+        "{}: {} \u{2192} {} chars",
+        change.field.name(),
+        change.old_chars,
+        change.new_chars
+    );
+    match change.prior_retained {
+        Some(true) => rendered.push_str(", prior content retained"),
+        Some(false) => rendered.push_str(", PRIOR CONTENT NOT RETAINED"),
+        None => {}
+    }
+    rendered
+}
+
 /// Print a summary of what changed for the issue.
-fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &Issue) {
-    println!("Updated {id}: {title}");
+fn print_update_summary(
+    id: &str,
+    title: &str,
+    before: Option<&Issue>,
+    after: &Issue,
+    text_changes: &[TextChange],
+) {
+    if text_changes.is_empty() {
+        println!("Updated {id}: {title}");
+    } else {
+        let deltas: Vec<String> = text_changes.iter().map(format_text_change).collect();
+        println!("Updated {id}: {title}  ({})", deltas.join("; "));
+    }
 
     if let Some(before) = before {
         // Status change

@@ -18,7 +18,7 @@
 
 #![allow(clippy::option_if_let_else, clippy::manual_map, clippy::manual_find)]
 
-use crate::error::{BeadsError, STATUS_ALL_HINT, VALID_STATUSES_HINT};
+use crate::error::{BeadsError, REPLACE_FLAG, STATUS_ALL_HINT, VALID_STATUSES_HINT};
 use crate::model::Status;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -60,6 +60,8 @@ pub enum ErrorCode {
     ValidationFailed,
     /// Invalid status value
     InvalidStatus,
+    /// A write would shrink a non-empty free-text field (refused by default)
+    DestructiveUpdate,
     /// Invalid issue type value
     InvalidType,
     /// Priority out of range (0-4)
@@ -136,6 +138,7 @@ impl ErrorCode {
             // Validation
             Self::ValidationFailed => "VALIDATION_FAILED",
             Self::InvalidStatus => "INVALID_STATUS",
+            Self::DestructiveUpdate => "DESTRUCTIVE_UPDATE",
             Self::InvalidType => "INVALID_TYPE",
             Self::InvalidPriority => "INVALID_PRIORITY",
             Self::RequiredField => "REQUIRED_FIELD",
@@ -178,6 +181,7 @@ impl ErrorCode {
             Self::DatabaseLocked
                 | Self::ValidationFailed
                 | Self::InvalidStatus
+                | Self::DestructiveUpdate
                 | Self::InvalidType
                 | Self::InvalidPriority
                 | Self::RequiredField
@@ -215,6 +219,7 @@ impl ErrorCode {
             // Validation (4)
             Self::ValidationFailed
             | Self::InvalidStatus
+            | Self::DestructiveUpdate
             | Self::InvalidType
             | Self::InvalidPriority
             | Self::RequiredField => 4,
@@ -527,6 +532,25 @@ impl StructuredError {
                         .collect::<Vec<_>>()
                 })),
             ),
+            BeadsError::DestructiveFieldShrink {
+                id,
+                field,
+                flag,
+                old_chars,
+                new_chars,
+            } => (
+                ErrorCode::DestructiveUpdate,
+                Some(json!({
+                    "id": id,
+                    "field": field,
+                    "flag": flag,
+                    "old_chars": old_chars,
+                    "new_chars": new_chars,
+                    "removed_chars": old_chars.saturating_sub(*new_chars),
+                    "override_flag": REPLACE_FLAG,
+                    "append_alternative": "br comments add",
+                })),
+            ),
             BeadsError::InvalidStatus { status } => (
                 ErrorCode::InvalidStatus,
                 Some(serde_json::json!({
@@ -615,6 +639,27 @@ impl StructuredError {
         // entirely (`-a/--all`).
         if let BeadsError::InvalidStatus { status } = err {
             return Some(status_hint(status));
+        }
+
+        // A refused destructive write: the caller's payload is intact and
+        // unwritten, so the hint's whole job is to name both ways forward
+        // without making either one the path of least resistance.
+        if let BeadsError::DestructiveFieldShrink {
+            id,
+            field,
+            flag,
+            old_chars,
+            new_chars,
+        } = err
+        {
+            let removed = old_chars.saturating_sub(*new_chars);
+            return Some(format!(
+                "This would remove {removed} of {old_chars} chars from {field}. \
+                 Nothing was written. To ADD to the field without losing what is there, \
+                 use 'br comments add {id} -f <file>' (append-only, attributed, timestamped) \
+                 or re-send {flag} with the existing text included. \
+                 To replace it anyway, re-run the same command with {REPLACE_FLAG}."
+            ));
         }
 
         // Otherwise check if BeadsError has a built-in suggestion
