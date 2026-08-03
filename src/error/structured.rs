@@ -1195,6 +1195,72 @@ mod tests {
         assert_eq!(values, Status::PARSEABLE.to_vec());
     }
 
+    /// A refused destructive write has to hand back everything the caller
+    /// needs to proceed, in the same envelope shape as any other refusal.
+    #[test]
+    fn destructive_shrink_reports_sizes_and_the_override_flag() {
+        let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+            id: "np-3pp".to_string(),
+            field: "notes".to_string(),
+            flag: "--notes".to_string(),
+            old_chars: 62,
+            new_chars: 27,
+        });
+        assert_eq!(err.code, ErrorCode::DestructiveUpdate);
+        assert_eq!(err.code.exit_code(), 4);
+        let ctx = err.context.as_ref().expect("context");
+        assert_eq!(ctx["old_chars"], 62);
+        assert_eq!(ctx["new_chars"], 27);
+        assert_eq!(ctx["removed_chars"], 35);
+        assert_eq!(ctx["override_flag"], "--replace");
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(hint.contains("--replace"), "{hint}");
+        assert!(hint.contains("br comments add"), "{hint}");
+        assert!(hint.contains("Nothing was written"), "{hint}");
+    }
+
+    /// A write that did not land as sent is a DIFFERENT failure from the
+    /// refusal, and automation has to be able to tell them apart: the
+    /// refusal prevented a loss, this one is reporting an accomplished one.
+    #[test]
+    fn write_mismatch_is_separable_from_the_refusal() {
+        let err = StructuredError::from_error(&BeadsError::WriteDidNotLandAsSent {
+            id: "np-3pp".to_string(),
+            field: "notes".to_string(),
+            requested_chars: 16,
+            stored_chars: 5,
+        });
+        assert_eq!(err.code, ErrorCode::WriteMismatch);
+        assert_eq!(err.code.as_str(), "WRITE_MISMATCH");
+        assert_eq!(err.code.exit_code(), 2);
+        assert_ne!(
+            ErrorCode::WriteMismatch.exit_code(),
+            ErrorCode::DestructiveUpdate.exit_code(),
+            "the two must be distinguishable by exit code alone"
+        );
+        let ctx = err.context.as_ref().expect("context");
+        assert_eq!(ctx["requested_chars"], 16);
+        assert_eq!(ctx["stored_chars"], 5);
+        // A boolean, not only a human string: this is what a script reads.
+        assert_eq!(ctx["landed_as_sent"], serde_json::Value::Bool(false));
+    }
+
+    /// The hint must not blame the caller's shell for something bd measured
+    /// on its own side of the boundary.
+    #[test]
+    fn write_mismatch_hint_locates_the_discrepancy_inside_bd() {
+        let err = StructuredError::from_error(&BeadsError::WriteDidNotLandAsSent {
+            id: "np-3pp".to_string(),
+            field: "notes".to_string(),
+            requested_chars: 16,
+            stored_chars: 5,
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(hint.contains("inside bd"), "{hint}");
+        assert!(hint.contains("br show np-3pp --json"), "{hint}");
+        assert!(hint.contains("do not treat the update as applied"), "{hint}");
+    }
+
     #[test]
     fn test_structured_error_ambiguous_id() {
         let matches = vec!["bd-abc".to_string(), "bd-abd".to_string()];

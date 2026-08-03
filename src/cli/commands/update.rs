@@ -63,7 +63,11 @@ impl From<&TextChange> for TextDeltaOutput {
             field: change.field.name(),
             old_chars: change.old_chars,
             new_chars: change.new_chars,
-            prior_content_retained: change.prior_retained,
+            // Suppressed when the write did not land as sent, exactly as on
+            // the human line: "prior content retained" is a true answer to a
+            // question the caller has stopped caring about, and next to a
+            // failure it reads as reassurance.
+            prior_content_retained: if mismatch { None } else { change.prior_retained },
             requested_chars: if mismatch {
                 change.requested_chars
             } else {
@@ -956,5 +960,113 @@ mod tests {
         let update = build_update(&args, "test_actor", false).unwrap();
         assert!(update.is_empty());
         info!("test_build_update_empty: assertions passed");
+    }
+
+    // === The success-line delta clause ===
+
+    #[test]
+    fn delta_clause_reports_growth_and_retention() {
+        let change = TextChange::measure_write(TextField::Notes, "abcde", "abcdefg", "abcdefg");
+        assert_eq!(
+            format_text_change(&change),
+            "notes: 5 \u{2192} 7 chars, prior content retained"
+        );
+    }
+
+    #[test]
+    fn delta_clause_shouts_when_growth_dropped_prior_content() {
+        let change = TextChange::measure_write(TextField::Notes, "aaaaa", "bbbbbbb", "bbbbbbb");
+        assert_eq!(
+            format_text_change(&change),
+            "notes: 5 \u{2192} 7 chars, PRIOR CONTENT NOT RETAINED"
+        );
+    }
+
+    /// The alarm leads, and the retention verdict is gone: it would be a true
+    /// statement ("prior content retained") sitting next to a failure, which
+    /// is how a line stops being read.
+    #[test]
+    fn delta_clause_leads_with_a_write_that_did_not_land() {
+        let change =
+            TextChange::measure_write(TextField::Notes, "abcde", "abcde", "abcdefghijKLMNOP");
+        let rendered = format_text_change(&change);
+        assert_eq!(
+            rendered,
+            "notes: WRITE DID NOT LAND AS SENT, requested 16 chars, stored 5 (5 \u{2192} 5 chars)"
+        );
+        assert!(!rendered.contains("retained"), "{rendered}");
+    }
+
+    /// The JSON must carry the same verdicts as the human line, since agents
+    /// read one and never the other.
+    #[test]
+    fn json_delta_mirrors_the_human_verdicts() {
+        let ok = TextDeltaOutput::from(&TextChange::measure_write(
+            TextField::Notes,
+            "abcde",
+            "abcdefg",
+            "abcdefg",
+        ));
+        assert_eq!(ok.prior_content_retained, Some(true));
+        assert_eq!(ok.landed_as_sent, None, "silence means it landed");
+        assert_eq!(ok.requested_chars, None);
+
+        let bad = TextDeltaOutput::from(&TextChange::measure_write(
+            TextField::Notes,
+            "abcde",
+            "abcde",
+            "abcdefghijKLMNOP",
+        ));
+        assert_eq!(bad.landed_as_sent, Some(false));
+        assert_eq!(bad.requested_chars, Some(16));
+        assert_eq!(bad.new_chars, 5);
+        assert_eq!(
+            bad.prior_content_retained, None,
+            "the retention verdict is suppressed alongside a failed write"
+        );
+    }
+
+    // === Which fields the guard sees ===
+
+    /// Every free-text flag on `UpdateArgs` must reach the guard. A field
+    /// added later that is not wired in here is silently ungated, which is
+    /// the original bug with a different flag name.
+    #[test]
+    fn requested_writes_cover_every_free_text_field() {
+        let args = UpdateArgs {
+            title: Some("t".to_string()),
+            description: Some("d".to_string()),
+            design: Some("de".to_string()),
+            acceptance_criteria: Some("ac".to_string()),
+            notes: Some("n".to_string()),
+            ..Default::default()
+        };
+        let writes = requested_text_writes(&args);
+        assert_eq!(writes.len(), TextField::ALL.len());
+        for field in TextField::ALL {
+            assert!(
+                writes.iter().any(|&(f, _)| f == field),
+                "{} is settable but never reaches the guard",
+                field.name()
+            );
+        }
+    }
+
+    /// A field the caller did not pass is not a write, and must not be
+    /// measured or gated as though it were.
+    #[test]
+    fn unpassed_fields_are_not_writes() {
+        let args = UpdateArgs {
+            notes: Some("n".to_string()),
+            ..Default::default()
+        };
+        let writes = requested_text_writes(&args);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, TextField::Notes);
+
+        assert!(
+            requested_text_writes(&UpdateArgs::default()).is_empty(),
+            "a status-only update writes no free text"
+        );
     }
 }
