@@ -15,8 +15,9 @@ mod context;
 mod structured;
 
 pub use context::{OptionExt, ResultExt};
-pub use structured::{ErrorCode, StructuredError};
+pub use structured::{ErrorCode, StructuredError, skip_context, skip_hint};
 
+use crate::model::Status;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -227,13 +228,197 @@ pub enum BeadsError {
     },
 
     // === Operational Errors ===
-    /// All requested items were skipped (already closed, not found, etc.).
-    #[error("Nothing to do: {reason}")]
-    NothingToDo { reason: String },
+    /// Every requested id was skipped: the state change happened nowhere.
+    ///
+    /// Carries the per-id [`SkipReason`] rather than a pre-rendered
+    /// sentence, because the whole point of `beads1-3c8h4` was that the
+    /// specific reason WAS computed and then discarded in favour of a
+    /// generic string. The hint and the human warning line are both
+    /// rendered from these values, so they cannot contradict each other.
+    #[error("Nothing to do: all {} issue(s) skipped", skipped.len())]
+    NothingToDo { skipped: Vec<SkippedTarget> },
+
+    /// Some requested ids changed state and some did not.
+    ///
+    /// A distinct variant from [`Self::NothingToDo`] because "nothing
+    /// happened" and "part of it happened" need different recovery: the
+    /// second caller has already committed some of the batch and must not
+    /// blindly re-run it, and must be told exactly which ids are still
+    /// outstanding.
+    #[error(
+        "Closed {closed} of {} requested issue(s): {} skipped",
+        closed + skipped.len(),
+        skipped.len()
+    )]
+    PartiallyClosed {
+        /// How many ids actually changed state.
+        closed: usize,
+        /// The ids that did not, and why.
+        skipped: Vec<SkippedTarget>,
+    },
 
     /// Wrapped anyhow error for gradual migration.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// One requested id that did not change state, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedTarget {
+    /// The id as resolved, not as typed.
+    pub id: String,
+    /// Why this id was left alone.
+    pub reason: SkipReason,
+}
+
+impl SkippedTarget {
+    /// Record a skip.
+    #[must_use]
+    pub fn new(id: impl Into<String>, reason: SkipReason) -> Self {
+        Self {
+            id: id.into(),
+            reason,
+        }
+    }
+}
+
+/// Why one requested id was not closed.
+///
+/// These are genuinely different situations with genuinely different
+/// remedies — close the blocker, reopen instead, check the id — and
+/// collapsing them into one sentence is what made `br close` tell an
+/// agent "already closed or not found" about an open, existing bead
+/// (bead `beads1-3c8h4`). Every surface that reports a skip renders it
+/// from this enum: [`Self::code`] for machines, [`Self::describe`] for
+/// the one-line warning, [`Self::remedy`] for what to do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Open blockers stand in the way (and `--force` was not given).
+    Blocked {
+        /// Blocking ids, as `id:status` when the status is known.
+        blockers: Vec<String>,
+    },
+    /// The issue is already in a terminal status.
+    ///
+    /// Carries the status so a tombstone is never described as "closed":
+    /// one is finished work, the other is a deleted bead.
+    AlreadyTerminal {
+        /// The status found in storage.
+        status: Status,
+    },
+    /// The id resolved but no row came back (deleted underneath us).
+    NotFound,
+}
+
+impl SkipReason {
+    /// Stable machine-readable discriminator.
+    ///
+    /// This is what a caller keys on instead of string-matching prose:
+    /// `blocked`, `already_closed`, `tombstoned`, `not_found`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Blocked { .. } => "blocked",
+            Self::AlreadyTerminal { status } => match status {
+                Status::Tombstone => "tombstoned",
+                _ => "already_closed",
+            },
+            Self::NotFound => "not_found",
+        }
+    }
+
+    /// Does the state the caller asked for nevertheless hold?
+    ///
+    /// This is the question the exit code answers: "is the world in the
+    /// state I asked for?", NOT "did bd personally perform a mutation".
+    /// An issue that was already closed satisfies `br close` the way an
+    /// existing directory satisfies `mkdir -p`, which is what makes the
+    /// command safe in the retry loops agents actually write.
+    ///
+    /// A tombstone does NOT satisfy it: a deleted bead is a different
+    /// terminal state from finished work, and a caller whose target was
+    /// deleted underneath them should stop rather than proceed.
+    #[must_use]
+    pub fn end_state_reached(&self) -> bool {
+        matches!(
+            self,
+            Self::AlreadyTerminal {
+                status: Status::Closed
+            }
+        )
+    }
+
+    /// The blocking ids, empty for every reason other than blocked.
+    #[must_use]
+    pub fn blockers(&self) -> &[String] {
+        match self {
+            Self::Blocked { blockers } => blockers,
+            _ => &[],
+        }
+    }
+
+    /// The one-line reason, as printed next to the id.
+    ///
+    /// The `Warning: Skipped <id>: <this>` line and the structured
+    /// `hint` are both built from this, so the two cannot drift.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Blocked { blockers } if blockers.is_empty() => {
+                "blocked by dependencies".to_string()
+            }
+            Self::Blocked { blockers } => format!("blocked by: {}", blockers.join(", ")),
+            Self::AlreadyTerminal { status } => format!("already {}", status.as_str()),
+            Self::NotFound => "issue not found".to_string(),
+        }
+    }
+
+    /// What the caller can do about it, naming only commands that exist
+    /// and only ids that can actually be passed to them.
+    #[must_use]
+    pub fn remedy(&self, ids: &[String]) -> String {
+        let targets = ids.join(" ");
+        match self {
+            Self::Blocked { blockers } => {
+                let blocker_ids: Vec<&str> = self
+                    .blockers()
+                    .iter()
+                    .map(|b| blocker_id(b))
+                    .collect::<Vec<_>>();
+                if blockers.is_empty() || blocker_ids.is_empty() {
+                    format!(
+                        "Close the blocking dependencies first, or re-run with --force to close {targets} anyway."
+                    )
+                } else {
+                    format!(
+                        "Close the blocker(s) first ('br close {}'), or re-run with --force to close {targets} anyway.",
+                        blocker_ids.join(" ")
+                    )
+                }
+            }
+            Self::AlreadyTerminal { status } => match status {
+                Status::Tombstone => format!(
+                    "{targets} is a tombstone (a deleted bead), not open work — there is nothing to close."
+                ),
+                _ => format!(
+                    "Nothing changed. Use 'br reopen {targets}' if the work is not actually done."
+                ),
+            },
+            Self::NotFound => {
+                format!("Run 'br list' to see available issues, or check the id: {targets}.")
+            }
+        }
+    }
+}
+
+/// The bare id part of a blocker rendered as `id:status`.
+///
+/// A hint that says `br close t-wg7:open` hands the caller a command
+/// that cannot run, and advice you cannot follow is how a hint teaches
+/// people to stop reading hints.
+#[must_use]
+pub fn blocker_id(blocker: &str) -> &str {
+    blocker.split(':').next().unwrap_or(blocker)
 }
 
 /// A single field validation error.
@@ -322,7 +507,7 @@ impl BeadsError {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::NothingToDo { .. } => 3,
+            Self::NothingToDo { .. } | Self::PartiallyClosed { .. } => 3,
             _ => 1,
         }
     }

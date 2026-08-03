@@ -18,7 +18,7 @@
 
 #![allow(clippy::option_if_let_else, clippy::manual_map, clippy::manual_find)]
 
-use crate::error::{BeadsError, REPLACE_FLAG, STATUS_ALL_HINT, VALID_STATUSES_HINT};
+use crate::error::{BeadsError, REPLACE_FLAG, STATUS_ALL_HINT, SkippedTarget, VALID_STATUSES_HINT};
 use crate::model::Status;
 use crate::validation::text_guard::TextField;
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,8 @@ pub enum ErrorCode {
     // === Operational Errors (exit code 3) ===
     /// All requested items were skipped; nothing to do
     NothingToDo,
+    /// Part of a multi-id request applied and part did not
+    PartiallyClosed,
 
     // === Internal Errors (exit code 1) ===
     /// Unexpected internal error
@@ -168,6 +170,7 @@ impl ErrorCode {
             Self::YamlError => "YAML_ERROR",
             // Operational
             Self::NothingToDo => "NOTHING_TO_DO",
+            Self::PartiallyClosed => "PARTIALLY_CLOSED",
             // Internal
             Self::InternalError => "INTERNAL_ERROR",
         }
@@ -220,7 +223,8 @@ impl ErrorCode {
             | Self::AmbiguousId
             | Self::IdCollision
             | Self::InvalidId
-            | Self::NothingToDo => 3,
+            | Self::NothingToDo
+            | Self::PartiallyClosed => 3,
             // Validation (4)
             Self::ValidationFailed
             | Self::InvalidStatus
@@ -638,9 +642,26 @@ impl StructuredError {
                 ErrorCode::DuplicateDependency,
                 Some(json!({"from": from, "to": to})),
             ),
-            BeadsError::NothingToDo { reason } => {
-                (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
-            }
+            BeadsError::NothingToDo { skipped } => (
+                ErrorCode::NothingToDo,
+                Some(skip_context(
+                    0,
+                    skipped,
+                    &format!("all {} issue(s) skipped", skipped.len()),
+                )),
+            ),
+            BeadsError::PartiallyClosed { closed, skipped } => (
+                ErrorCode::PartiallyClosed,
+                Some(skip_context(
+                    *closed,
+                    skipped,
+                    &format!(
+                        "closed {closed} of {}, {} skipped",
+                        closed + skipped.len(),
+                        skipped.len()
+                    ),
+                )),
+            ),
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
             BeadsError::Io(_) => (ErrorCode::IoError, None),
             BeadsError::Json(_) => (ErrorCode::JsonError, None),
@@ -756,15 +777,150 @@ impl StructuredError {
                 }
                 Some(format!("Use --force to delete '{id}' anyway."))
             }
-            BeadsError::NothingToDo { .. } => {
-                Some("All specified issues were already closed or not found.".to_string())
-            }
+            // The generic "already closed or not found" sentence used to
+            // sit here and contradicted the per-id reason printed two lines
+            // above it (bead `beads1-3c8h4`). The hint is now rendered from
+            // the same `SkipReason` values as the warning line, so the two
+            // cannot disagree.
+            BeadsError::NothingToDo { skipped } => Some(skip_hint(skipped)),
+            BeadsError::PartiallyClosed { closed, skipped } => Some(format!(
+                "{closed} of {} requested issue(s) closed. {}",
+                closed + skipped.len(),
+                skip_hint(skipped)
+            )),
             BeadsError::JsonlParse { line, .. } => Some(format!(
                 "Check line {line} of the JSONL file for syntax errors."
             )),
             _ => None,
         }
     }
+}
+
+/// The reason discriminators, in the order a hint mentions them:
+/// the things the caller must act on first.
+const SKIP_CODE_ORDER: [&str; 4] = ["blocked", "not_found", "tombstoned", "already_closed"];
+
+/// Machine-readable account of a partly- or wholly-skipped batch.
+///
+/// Everything a caller needs is keyed, not prose: `skipped[].reason` is a
+/// stable discriminator (`blocked`, `already_closed`, `tombstoned`,
+/// `not_found`), `skipped[].blockers` names the blockers, and
+/// `outstanding` is the subset the caller still has to do something
+/// about. Nothing here requires string-matching a sentence.
+///
+/// `reason` (the summary string) is retained because it is what the
+/// previous `NOTHING_TO_DO` context carried, and dropping a field is a
+/// break for a consumer that reads it.
+#[must_use]
+pub fn skip_context(closed: usize, skipped: &[SkippedTarget], summary: &str) -> Value {
+    let entries: Vec<Value> = skipped
+        .iter()
+        .map(|s| {
+            let mut entry = json!({
+                "id": s.id,
+                "reason": s.reason.code(),
+                "detail": s.reason.describe(),
+                "end_state_reached": s.reason.end_state_reached(),
+            });
+            let blockers = s.reason.blockers();
+            if !blockers.is_empty() {
+                entry["blockers"] = json!(blockers);
+            }
+            entry
+        })
+        .collect();
+
+    let mut reasons: Vec<&str> = Vec::new();
+    for skip in skipped {
+        let code = skip.reason.code();
+        if !reasons.contains(&code) {
+            reasons.push(code);
+        }
+    }
+
+    let outstanding: Vec<&str> = skipped
+        .iter()
+        .filter(|s| !s.reason.end_state_reached())
+        .map(|s| s.id.as_str())
+        .collect();
+
+    json!({
+        "reason": summary,
+        "requested_count": closed + skipped.len(),
+        "closed_count": closed,
+        "skipped_count": skipped.len(),
+        "skip_reasons": reasons,
+        "outstanding": outstanding,
+        "skipped": entries,
+    })
+}
+
+/// The hint for a skipped batch, rendered from the same
+/// [`crate::error::SkipReason`] values as the `Warning: Skipped ...` lines.
+///
+/// One sentence per blocked id (each has its own blockers and its own
+/// remedy), one sentence per other reason group. Long batches are
+/// truncated with a pointer at `context.skipped`, which is complete.
+#[must_use]
+pub fn skip_hint(skipped: &[SkippedTarget]) -> String {
+    /// Beyond this many ids in one group the hint stops enumerating.
+    const MAX_LISTED: usize = 3;
+
+    let mut sentences: Vec<String> = Vec::new();
+
+    for code in SKIP_CODE_ORDER {
+        let group: Vec<&SkippedTarget> = skipped
+            .iter()
+            .filter(|s| s.reason.code() == code)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+
+        if code == "blocked" {
+            // Blockers differ per id, so each blocked id gets its own
+            // sentence naming ITS blockers — the whole point of the fix is
+            // that the specific reason survives to the caller.
+            for skip in group.iter().take(MAX_LISTED) {
+                sentences.push(format!(
+                    "{} was not closed: {}. {}",
+                    skip.id,
+                    skip.reason.describe(),
+                    skip.reason.remedy(std::slice::from_ref(&skip.id))
+                ));
+            }
+            if group.len() > MAX_LISTED {
+                sentences.push(format!(
+                    "{} further blocked issue(s) were skipped; see context.skipped for all of them.",
+                    group.len() - MAX_LISTED
+                ));
+            }
+            continue;
+        }
+
+        let ids: Vec<String> = group.iter().map(|s| s.id.clone()).collect();
+        let listed: Vec<String> = ids.iter().take(MAX_LISTED).cloned().collect();
+        let and_more = if ids.len() > listed.len() {
+            format!(" (and {} more; see context.skipped)", ids.len() - listed.len())
+        } else {
+            String::new()
+        };
+        // `describe`/`remedy` come from the group's own reason, so the
+        // sentence cannot claim a reason that was not the reason.
+        let reason = &group[0].reason;
+        sentences.push(format!(
+            "{}{and_more}: {}. {}",
+            listed.join(", "),
+            reason.describe(),
+            reason.remedy(&listed)
+        ));
+    }
+
+    if sentences.is_empty() {
+        // No skips recorded: say that rather than inventing a reason.
+        return "No issues changed state.".to_string();
+    }
+    sentences.join(" ")
 }
 
 /// The targeted part of an invalid-status hint, if there is one: a
