@@ -687,4 +687,130 @@ mod tests {
         let err = ValidationError::new("priority", "must be 0-4");
         assert_eq!(err.to_string(), "priority: must be 0-4");
     }
+
+    // =========================================================================
+    // Skip reasons (bead beads1-3c8h4)
+    // =========================================================================
+
+    #[test]
+    fn skip_reason_codes_are_stable_and_distinct() {
+        // These strings are the machine contract: a caller keys on them
+        // instead of matching prose, so changing one is a breaking change.
+        assert_eq!(
+            SkipReason::Blocked {
+                blockers: vec!["t-b".to_string()]
+            }
+            .code(),
+            "blocked"
+        );
+        assert_eq!(
+            SkipReason::AlreadyTerminal {
+                status: Status::Closed
+            }
+            .code(),
+            "already_closed"
+        );
+        assert_eq!(
+            SkipReason::AlreadyTerminal {
+                status: Status::Tombstone
+            }
+            .code(),
+            "tombstoned"
+        );
+        assert_eq!(SkipReason::NotFound.code(), "not_found");
+    }
+
+    #[test]
+    fn only_an_already_closed_issue_counts_as_the_requested_end_state() {
+        assert!(
+            SkipReason::AlreadyTerminal {
+                status: Status::Closed
+            }
+            .end_state_reached(),
+            "already closed satisfies close (mkdir -p semantics)"
+        );
+        // A tombstone is a DELETED bead, not finished work. Treating it as
+        // satisfied would let an agent conclude it closed something that no
+        // longer exists.
+        assert!(
+            !SkipReason::AlreadyTerminal {
+                status: Status::Tombstone
+            }
+            .end_state_reached(),
+            "a tombstone is not the end state the caller asked for"
+        );
+        assert!(
+            !SkipReason::Blocked {
+                blockers: vec!["t-b".to_string()]
+            }
+            .end_state_reached()
+        );
+        assert!(!SkipReason::NotFound.end_state_reached());
+    }
+
+    #[test]
+    fn describe_never_calls_a_tombstone_closed() {
+        let described = SkipReason::AlreadyTerminal {
+            status: Status::Tombstone,
+        }
+        .describe();
+        assert!(described.contains("tombstone"), "{described}");
+        assert_ne!(described, "already closed");
+    }
+
+    #[test]
+    fn remedy_for_blocked_suggests_a_command_that_can_actually_run() {
+        let reason = SkipReason::Blocked {
+            blockers: vec!["t-b:open".to_string(), "t-c:in_progress".to_string()],
+        };
+        let remedy = reason.remedy(&["t-a".to_string()]);
+        // `br close t-b:open` is not a runnable command.
+        assert!(remedy.contains("br close t-b t-c"), "{remedy}");
+        assert!(!remedy.contains(":open"), "{remedy}");
+        assert!(remedy.contains("--force"), "{remedy}");
+    }
+
+    #[test]
+    fn remedy_for_blocked_without_known_blockers_still_says_something_useful() {
+        let reason = SkipReason::Blocked { blockers: vec![] };
+        let remedy = reason.remedy(&["t-a".to_string()]);
+        assert!(remedy.contains("blocking dependencies"), "{remedy}");
+        assert!(remedy.contains("--force"), "{remedy}");
+        // No empty quotes where a command should be.
+        assert!(!remedy.contains("''"), "{remedy}");
+    }
+
+    #[test]
+    fn blocker_id_strips_the_status_suffix() {
+        assert_eq!(blocker_id("t-b:open"), "t-b");
+        assert_eq!(blocker_id("t-b"), "t-b");
+        assert_eq!(blocker_id(""), "");
+    }
+
+    #[test]
+    fn skipped_batches_never_exit_zero_at_the_error_layer() {
+        // Whatever the shape, an error that reaches this layer must carry a
+        // non-zero exit code: exiting 0 while printing an "error" object is
+        // the defect in bead beads1-3c8h4.
+        let nothing = BeadsError::NothingToDo {
+            skipped: vec![SkippedTarget::new("t-a", SkipReason::NotFound)],
+        };
+        let partial = BeadsError::PartiallyClosed {
+            closed: 1,
+            skipped: vec![SkippedTarget::new(
+                "t-a",
+                SkipReason::Blocked {
+                    blockers: vec!["t-b:open".to_string()],
+                },
+            )],
+        };
+        assert_eq!(nothing.exit_code(), 3);
+        assert_eq!(partial.exit_code(), 3);
+        assert_ne!(nothing.exit_code(), 0);
+        assert_ne!(partial.exit_code(), 0);
+        // The messages must not be interchangeable: "nothing happened" and
+        // "part of it happened" need different recovery.
+        assert!(nothing.to_string().contains("Nothing to do"));
+        assert!(partial.to_string().contains("Closed 1 of 2"));
+    }
 }

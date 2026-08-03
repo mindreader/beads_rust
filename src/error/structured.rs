@@ -1534,4 +1534,208 @@ mod tests {
         assert!(colored.contains("\x1b[31m")); // Red color code
         assert!(colored.contains("\x1b[33m")); // Yellow color code
     }
+
+    // =========================================================================
+    // Skip reporting (bead beads1-3c8h4): the hint must say what actually
+    // happened, and a caller must be able to tell blocked from
+    // already-closed without reading English.
+    // =========================================================================
+
+    use crate::error::SkipReason;
+
+    /// The exact sentence the old hint always printed. Kept as a literal so
+    /// that reintroducing it anywhere fails a test.
+    const OLD_WRONG_HINT: &str = "All specified issues were already closed or not found.";
+
+    fn blocked(id: &str, blockers: &[&str]) -> SkippedTarget {
+        SkippedTarget::new(
+            id,
+            SkipReason::Blocked {
+                blockers: blockers.iter().map(|b| (*b).to_string()).collect(),
+            },
+        )
+    }
+
+    fn already(id: &str) -> SkippedTarget {
+        SkippedTarget::new(
+            id,
+            SkipReason::AlreadyTerminal {
+                status: Status::Closed,
+            },
+        )
+    }
+
+    #[test]
+    fn skip_hint_for_a_blocked_id_names_the_blocker_and_says_what_to_do() {
+        let skipped = vec![blocked("t-1euci", &["t-21y5o:open"])];
+        let hint = skip_hint(&skipped);
+
+        assert!(hint.contains("t-1euci"), "names the skipped id: {hint}");
+        assert!(hint.contains("t-21y5o"), "names the blocker: {hint}");
+        assert!(hint.contains("--force"), "offers the override: {hint}");
+        // The blocker is stored as `id:status`; a suggested command has to
+        // carry the bare id or it cannot be pasted.
+        assert!(
+            hint.contains("br close t-21y5o'"),
+            "suggests a runnable command: {hint}"
+        );
+    }
+
+    #[test]
+    fn skip_hint_for_a_blocked_id_does_not_claim_it_was_already_closed() {
+        let hint = skip_hint(&[blocked("t-1euci", &["t-21y5o:open"])]);
+        assert!(
+            !hint.contains("already closed"),
+            "blocked is not already closed: {hint}"
+        );
+        assert!(
+            !hint.contains("not found"),
+            "blocked is not not-found: {hint}"
+        );
+        assert_ne!(hint, OLD_WRONG_HINT);
+    }
+
+    #[test]
+    fn skip_hint_agrees_with_the_warning_line_for_every_reason() {
+        // Both surfaces render from SkipReason, so the detail printed as
+        // `Warning: Skipped <id>: <detail>` must appear in the hint.
+        let cases = vec![
+            blocked("t-a", &["t-b:open"]),
+            already("t-c"),
+            SkippedTarget::new(
+                "t-d",
+                SkipReason::AlreadyTerminal {
+                    status: Status::Tombstone,
+                },
+            ),
+            SkippedTarget::new("t-e", SkipReason::NotFound),
+        ];
+        for target in &cases {
+            let hint = skip_hint(std::slice::from_ref(target));
+            let warning_detail = target.reason.describe();
+            assert!(
+                hint.contains(&warning_detail),
+                "hint {hint:?} must contain the warning detail {warning_detail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_hint_keeps_mixed_reasons_apart() {
+        let skipped = vec![
+            blocked("t-a", &["t-b:open"]),
+            already("t-c"),
+            SkippedTarget::new(
+                "t-d",
+                SkipReason::AlreadyTerminal {
+                    status: Status::Tombstone,
+                },
+            ),
+        ];
+        let hint = skip_hint(&skipped);
+        assert!(hint.contains("t-a") && hint.contains("blocked by"), "{hint}");
+        assert!(hint.contains("t-c") && hint.contains("br reopen"), "{hint}");
+        assert!(hint.contains("t-d") && hint.contains("tombstone"), "{hint}");
+        // A tombstone must never be advertised as reopenable work: it is a
+        // deleted bead, and `br reopen` on it is not the remedy.
+        assert!(
+            !hint.contains("br reopen t-d"),
+            "tombstone advice must not offer reopen: {hint}"
+        );
+    }
+
+    #[test]
+    fn skip_hint_stops_enumerating_long_groups_but_points_at_the_full_list() {
+        let skipped: Vec<SkippedTarget> = (0..7).map(|i| already(&format!("t-{i}"))).collect();
+        let hint = skip_hint(&skipped);
+        assert!(hint.contains("t-0"), "lists the first few: {hint}");
+        assert!(hint.contains("and 4 more"), "counts the rest: {hint}");
+        assert!(
+            hint.contains("context.skipped"),
+            "points at the complete list: {hint}"
+        );
+        // Truncation must not silently drop ids from the machine-readable
+        // side: context.skipped carries all 7.
+        let ctx = skip_context(0, &skipped, "all 7 issue(s) skipped");
+        assert_eq!(ctx["skipped"].as_array().expect("array").len(), 7);
+    }
+
+    #[test]
+    fn skip_hint_with_many_blocked_ids_names_the_first_few_and_counts_the_rest() {
+        let skipped: Vec<SkippedTarget> = (0..5)
+            .map(|i| blocked(&format!("t-{i}"), &["t-b:open"]))
+            .collect();
+        let hint = skip_hint(&skipped);
+        assert!(hint.contains("t-0 was not closed"), "{hint}");
+        assert!(hint.contains("2 further blocked issue(s)"), "{hint}");
+        assert!(hint.contains("context.skipped"), "{hint}");
+    }
+
+    #[test]
+    fn skip_hint_with_no_skips_does_not_invent_a_reason() {
+        // Guards the fallback: a hint must never assert something the code
+        // did not observe, which is the whole of bead beads1-3c8h4.
+        let hint = skip_hint(&[]);
+        assert_eq!(hint, "No issues changed state.");
+        assert!(!hint.contains("already closed"));
+        assert!(!hint.contains("blocked"));
+    }
+
+    #[test]
+    fn skip_context_lets_a_caller_discriminate_without_reading_prose() {
+        let skipped = vec![blocked("t-a", &["t-b:open"]), already("t-c")];
+        let ctx = skip_context(1, &skipped, "closed 1 of 3, 2 skipped");
+
+        assert_eq!(ctx["requested_count"], 3);
+        assert_eq!(ctx["closed_count"], 1);
+        assert_eq!(ctx["skipped_count"], 2);
+        assert_eq!(ctx["skipped"][0]["reason"], "blocked");
+        assert_eq!(ctx["skipped"][0]["blockers"][0], "t-b:open");
+        assert_eq!(ctx["skipped"][0]["end_state_reached"], false);
+        assert_eq!(ctx["skipped"][1]["reason"], "already_closed");
+        assert_eq!(ctx["skipped"][1]["end_state_reached"], true);
+        assert!(ctx["skipped"][1].get("blockers").is_none());
+        // `outstanding` is the actionable subset: what the caller still has
+        // to do something about, already-closed excluded.
+        assert_eq!(ctx["outstanding"], json!(["t-a"]));
+        assert_eq!(ctx["skip_reasons"], json!(["blocked", "already_closed"]));
+        // Retained for consumers of the previous NOTHING_TO_DO context.
+        assert_eq!(ctx["reason"], "closed 1 of 3, 2 skipped");
+    }
+
+    #[test]
+    fn nothing_to_do_reports_the_computed_reason_not_a_generic_sentence() {
+        let err = BeadsError::NothingToDo {
+            skipped: vec![blocked("t-1euci", &["t-21y5o:open"])],
+        };
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::NothingToDo);
+        assert_eq!(structured.code.exit_code(), 3);
+        let hint = structured.hint.as_deref().expect("hint");
+        assert_ne!(hint, OLD_WRONG_HINT, "the generic sentence is back");
+        assert!(hint.contains("t-21y5o"), "{hint}");
+        let ctx = structured.context.expect("context");
+        assert_eq!(ctx["skipped"][0]["reason"], "blocked");
+        assert_eq!(ctx["outstanding"], json!(["t-1euci"]));
+    }
+
+    #[test]
+    fn partially_closed_is_a_distinct_code_that_still_fails() {
+        let err = BeadsError::PartiallyClosed {
+            closed: 2,
+            skipped: vec![blocked("t-a", &["t-b:open"])],
+        };
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::PartiallyClosed);
+        assert_eq!(structured.code.as_str(), "PARTIALLY_CLOSED");
+        assert_ne!(structured.code, ErrorCode::NothingToDo);
+        assert_eq!(structured.code.exit_code(), 3);
+        assert!(!structured.retryable);
+        assert!(structured.message.contains("Closed 2 of 3"));
+        let ctx = structured.context.expect("context");
+        assert_eq!(ctx["closed_count"], 2);
+        assert_eq!(ctx["outstanding"], json!(["t-a"]));
+    }
 }
