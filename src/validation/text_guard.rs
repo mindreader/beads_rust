@@ -47,6 +47,27 @@
 /// Every variant here is a field whose entire contents are replaced by a
 /// single CLI flag, and therefore a field that can be destroyed by one
 /// well-formed command.
+///
+/// # Why this list and not every settable string
+///
+/// THE SHRINK TEST IS ONLY MEANINGFUL FOR FIELDS WHOSE CONTENT ACCUMULATES.
+/// It is a proxy for "prose that was built up over time got destroyed". An
+/// identifier does not accumulate — it is replaced by nature, and a shorter
+/// replacement is a normal correction. `--external-ref` (a long tracker URL
+/// swapped for a short canonical one) and `--session` are therefore
+/// deliberately absent: not because they matter less, but because on an
+/// identifier "smaller" carries no information about destruction, and a guard
+/// that cries wolf on legitimate corrections teaches callers to pass
+/// `--replace` reflexively — which would cost the protection on the five
+/// fields where it IS meaningful.
+///
+/// `--assignee`, `--owner`, `--due` and `--defer` are absent for a related
+/// reason: they already document "empty string clears" as an intentional
+/// affordance. That precedent is what this guard generalises — an explicit
+/// clear, where clearing prose used to be implicit and silent. They remain
+/// reachable by the same shell accident (`--assignee "$(cmd-that-fails)"`
+/// unassigns), which is a KNOWN AND ACCEPTED residual: a single recoverable
+/// word, visible in the next `br show`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextField {
     /// `--title`
