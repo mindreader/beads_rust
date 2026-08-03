@@ -20,6 +20,7 @@
 
 use crate::error::{BeadsError, REPLACE_FLAG, STATUS_ALL_HINT, VALID_STATUSES_HINT};
 use crate::model::Status;
+use crate::validation::text_guard::TextField;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -552,7 +553,11 @@ impl StructuredError {
                     "new_chars": new_chars,
                     "removed_chars": old_chars.saturating_sub(*new_chars),
                     "override_flag": REPLACE_FLAG,
-                    "append_alternative": "br comments add",
+                    // Absent for the title, which has no append channel:
+                    // a machine reader must not be handed an alternative
+                    // that does not exist for this field.
+                    "append_alternative": field_has_append_alternative(field)
+                        .then_some("br comments add"),
                 })),
             ),
             BeadsError::WriteDidNotLandAsSent {
@@ -672,11 +677,22 @@ impl StructuredError {
         } = err
         {
             let removed = old_chars.saturating_sub(*new_chars);
+            // The append channel is named only for fields that have one.
+            // Telling someone retitling an issue to "use br comments add"
+            // is advice they cannot follow, and a hint that does not fit
+            // the situation is a hint that stops being read.
+            let keep_it = if field_has_append_alternative(field) {
+                format!(
+                    "To ADD to the field without losing what is there, use \
+                     'br comments add {id} -f <file>' (append-only, attributed, timestamped) \
+                     or re-send {flag} with the existing text included."
+                )
+            } else {
+                format!("To keep what is there, re-send {flag} with the existing text included.")
+            };
             return Some(format!(
                 "This would remove {removed} of {old_chars} chars from {field}. \
-                 Nothing was written. To ADD to the field without losing what is there, \
-                 use 'br comments add {id} -f <file>' (append-only, attributed, timestamped) \
-                 or re-send {flag} with the existing text included. \
+                 Nothing was written. {keep_it} \
                  To replace it anyway, re-run the same command with {REPLACE_FLAG}."
             ));
         }
@@ -760,6 +776,15 @@ fn status_did_you_mean(provided: &str) -> Option<String> {
         return Some(STATUS_ALL_HINT.to_string());
     }
     detect_status_intent(provided).map(|detected| format!("Did you mean --status {detected}?"))
+}
+
+/// Whether `br comments add` is a usable alternative for this field.
+///
+/// An unrecognised name is treated as having one: a field added later is far
+/// more likely to be prose than to be another one-line label, and the cost of
+/// being wrong is one extra sentence in a hint, not a lost payload.
+fn field_has_append_alternative(field: &str) -> bool {
+    TextField::from_name(field).is_none_or(TextField::has_append_alternative)
 }
 
 /// Full hint for an unparseable status: the targeted suggestion (when
@@ -1217,6 +1242,68 @@ mod tests {
         assert!(hint.contains("--replace"), "{hint}");
         assert!(hint.contains("br comments add"), "{hint}");
         assert!(hint.contains("Nothing was written"), "{hint}");
+    }
+
+    /// A title has no append channel, so neither the hint nor the machine
+    /// context may name one. Advice a caller cannot follow is how a hint
+    /// teaches people to skip hints.
+    #[test]
+    fn title_refusal_does_not_advertise_an_append_channel() {
+        let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+            id: "np-3pp".to_string(),
+            field: "title".to_string(),
+            flag: "--title".to_string(),
+            old_chars: 23,
+            new_chars: 5,
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(
+            !hint.contains("br comments add"),
+            "a title cannot be appended to: {hint}"
+        );
+        assert!(hint.contains("--replace"), "{hint}");
+        assert!(hint.contains("re-send --title"), "{hint}");
+        assert!(hint.contains("Nothing was written"), "{hint}");
+        let ctx = err.context.as_ref().expect("context");
+        assert_eq!(
+            ctx["append_alternative"],
+            serde_json::Value::Null,
+            "machine readers must not be handed a channel this field lacks"
+        );
+    }
+
+    /// Prose fields keep the append advice — that is the whole point of the
+    /// hint, and the title carve-out must not quietly swallow it.
+    #[test]
+    fn prose_field_refusals_all_name_the_append_channel() {
+        for field in ["description", "design", "acceptance_criteria", "notes"] {
+            let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+                id: "np-3pp".to_string(),
+                field: field.to_string(),
+                flag: format!("--{field}"),
+                old_chars: 62,
+                new_chars: 27,
+            });
+            let hint = err.hint.as_deref().expect("hint");
+            assert!(hint.contains("br comments add"), "{field}: {hint}");
+            let ctx = err.context.as_ref().expect("context");
+            assert_eq!(ctx["append_alternative"], "br comments add", "{field}");
+        }
+    }
+
+    /// An unknown field name must fail toward MORE advice, not less: a field
+    /// added later is prose until someone says otherwise.
+    #[test]
+    fn unknown_field_keeps_the_append_advice() {
+        let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+            id: "np-3pp".to_string(),
+            field: "some_future_field".to_string(),
+            flag: "--some-future-field".to_string(),
+            old_chars: 62,
+            new_chars: 27,
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(hint.contains("br comments add"), "{hint}");
     }
 
     /// A write that did not land as sent is a DIFFERENT failure from the

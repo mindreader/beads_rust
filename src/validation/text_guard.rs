@@ -94,6 +94,23 @@ impl TextField {
             Self::Notes => "--notes",
         }
     }
+
+    /// Recover a field from its stable [`name`](Self::name).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|field| field.name() == name)
+    }
+
+    /// Whether "append instead of replacing" is sensible advice for this field.
+    ///
+    /// False for the title: a title is a one-line label, not a running record,
+    /// so pointing a caller who is retitling an issue at `br comments add` is
+    /// advice they cannot use. Every other field here is prose that a caller
+    /// may well have meant to add to.
+    #[must_use]
+    pub const fn has_append_alternative(self) -> bool {
+        !matches!(self, Self::Title)
+    }
 }
 
 /// The measured transition of one free-text field from an old to a new value.
