@@ -502,6 +502,8 @@ mod tests {
             skipped: vec![SkippedIssue {
                 id: "bd-456".to_string(),
                 reason: "already closed".to_string(),
+                reason_code: "already_closed".to_string(),
+                ..Default::default()
             }],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -531,6 +533,8 @@ mod tests {
             skipped: vec![SkippedIssue {
                 id: "bd-c".to_string(),
                 reason: "blocked by: bd-d".to_string(),
+                reason_code: "blocked".to_string(),
+                blockers: vec!["bd-d".to_string()],
             }],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -587,6 +591,8 @@ mod tests {
             skipped: vec![SkippedIssue {
                 id: "bd-x".to_string(),
                 reason: "not found".to_string(),
+                reason_code: "not_found".to_string(),
+                ..Default::default()
             }],
             unblocked: vec![],
         };
@@ -653,6 +659,8 @@ mod tests {
         let skipped = SkippedIssue {
             id: "bd-skip".to_string(),
             reason: "already closed".to_string(),
+            reason_code: "already_closed".to_string(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&skipped).unwrap();
         assert!(json.contains("\"id\":\"bd-skip\""));
@@ -664,6 +672,8 @@ mod tests {
         let skipped = SkippedIssue {
             id: "bd-blocked".to_string(),
             reason: "blocked by: bd-dep1, bd-dep2".to_string(),
+            reason_code: "blocked".to_string(),
+            blockers: vec!["bd-dep1".to_string(), "bd-dep2".to_string()],
         };
         let json = serde_json::to_string(&skipped).unwrap();
         let parsed: SkippedIssue = serde_json::from_str(&json).unwrap();
@@ -730,10 +740,14 @@ mod tests {
                 SkippedIssue {
                     id: "bd-3".to_string(),
                     reason: "issue not found".to_string(),
+                    reason_code: "not_found".to_string(),
+                    ..Default::default()
                 },
                 SkippedIssue {
                     id: "bd-4".to_string(),
                     reason: "already tombstone".to_string(),
+                    reason_code: "tombstoned".to_string(),
+                    ..Default::default()
                 },
             ],
         };
