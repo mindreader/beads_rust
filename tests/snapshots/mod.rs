@@ -764,6 +764,23 @@ fn normalize_id_string(s: &str) -> String {
         .to_string()
 }
 
+/// Map `f` over an array value, leaving non-arrays to the generic pass.
+fn normalize_array(value: &Value, f: impl Fn(&Value) -> Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(f).collect()),
+        other => normalize_json(other),
+    }
+}
+
+/// An element that is itself a bare issue ID.
+fn normalize_id_element(value: &Value) -> Value {
+    if matches!(value, Value::String(_)) {
+        Value::String("ISSUE_ID".to_string())
+    } else {
+        normalize_json(value)
+    }
+}
+
 pub fn normalize_json(json: &Value) -> Value {
     match json {
         Value::Object(map) => {
@@ -813,67 +830,15 @@ pub fn normalize_json(json: &Value) -> Value {
                         }
                     }
                     // Handle blocked_by array which contains ID:status strings
-                    "blocked_by" | "blocks" | "depends_on" => {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|v| {
-                                        if let Value::String(s) = v {
-                                            Value::String(normalize_id_string(s))
-                                        } else {
-                                            normalize_json(v)
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            normalize_json(value)
-                        }
-                    }
-                    "roots" => {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|v| {
-                                        if matches!(v, Value::String(_)) {
-                                            Value::String("ISSUE_ID".to_string())
-                                        } else {
-                                            normalize_json(v)
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            normalize_json(value)
-                        }
-                    }
-                    "edges" => {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|edge| match edge {
-                                        Value::Array(pair) => Value::Array(
-                                            pair.iter()
-                                                .map(|v| {
-                                                    if matches!(v, Value::String(_)) {
-                                                        Value::String("ISSUE_ID".to_string())
-                                                    } else {
-                                                        normalize_json(v)
-                                                    }
-                                                })
-                                                .collect(),
-                                        ),
-                                        _ => normalize_json(edge),
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            normalize_json(value)
-                        }
-                    }
+                    "blocked_by" | "blocks" | "depends_on" => normalize_array(value, |v| match v {
+                        Value::String(s) => Value::String(normalize_id_string(s)),
+                        other => normalize_json(other),
+                    }),
+                    "roots" => normalize_array(value, normalize_id_element),
+                    "edges" => normalize_array(value, |edge| match edge {
+                        Value::Array(_) => normalize_array(edge, normalize_id_element),
+                        other => normalize_json(other),
+                    }),
                     _ => normalize_json(value),
                 };
                 new_map.insert(key.clone(), normalized_value);
