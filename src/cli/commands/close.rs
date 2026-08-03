@@ -383,9 +383,7 @@ fn outcome(closed_count: usize, skipped: Vec<SkippedTarget>, use_json: bool) -> 
         return Ok(());
     }
 
-    let outstanding = skipped
-        .iter()
-        .any(|skip| !skip.reason.end_state_reached());
+    let outstanding = skipped.iter().any(|skip| !skip.reason.end_state_reached());
 
     if outstanding {
         if closed_count == 0 {

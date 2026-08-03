@@ -45,7 +45,11 @@ fn workspace() -> BrWorkspace {
 
 fn create(workspace: &BrWorkspace, title: &str) -> String {
     let created = run_br(workspace, ["create", title, "-p", "2"], "create");
-    assert!(created.status.success(), "create failed: {}", created.stderr);
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        created.stderr
+    );
     parse_created_id(&created.stdout)
 }
 
@@ -140,7 +144,10 @@ fn blocked_close_is_machine_readable_without_parsing_prose() {
     // The discriminator: `blocked`, not a sentence to grep.
     assert_eq!(context["skipped"][0]["reason"], "blocked");
     assert_eq!(context["skipped"][0]["end_state_reached"], false);
-    assert_eq!(context["skipped"][0]["blockers"][0], format!("{blocker}:open"));
+    assert_eq!(
+        context["skipped"][0]["blockers"][0],
+        format!("{blocker}:open")
+    );
     assert_eq!(context["outstanding"][0], blocked);
     assert_eq!(context["closed_count"], 0);
     assert_eq!(context["requested_count"], 1);
@@ -194,7 +201,11 @@ fn a_tombstone_is_not_reported_as_already_closed() {
     let workspace = workspace();
     let doomed = create(&workspace, "Doomed issue");
     let deleted = run_br(&workspace, ["delete", &doomed, "--force"], "delete");
-    assert!(deleted.status.success(), "delete failed: {}", deleted.stderr);
+    assert!(
+        deleted.status.success(),
+        "delete failed: {}",
+        deleted.stderr
+    );
 
     let closed = run_br(&workspace, ["close", &doomed, "--json"], "close_tombstone");
     assert_eq!(
@@ -232,7 +243,9 @@ fn a_partial_batch_closes_what_it_can_and_still_exits_non_zero() {
 
     let closed = run_br(
         &workspace,
-        ["close", &first, &blocked, &last, "--reason", "batch", "--json"],
+        [
+            "close", &first, &blocked, &last, "--reason", "batch", "--json",
+        ],
         "close_partial",
     );
 
@@ -305,7 +318,11 @@ fn a_partial_batch_skip_is_visible_on_a_machine_readable_surface() {
 fn closing_an_already_closed_issue_succeeds_and_still_reports_the_skip() {
     let workspace = workspace();
     let id = create(&workspace, "Done already");
-    let first = run_br(&workspace, ["close", &id, "--reason", "done"], "close_first");
+    let first = run_br(
+        &workspace,
+        ["close", &id, "--reason", "done"],
+        "close_first",
+    );
     assert!(first.status.success(), "stderr={}", first.stderr);
 
     let again = run_br(&workspace, ["close", &id, "--json"], "close_again");
@@ -377,7 +394,11 @@ fn an_already_closed_id_mixed_with_a_blocked_one_still_fails() {
     let close = run_br(&workspace, ["close", &done, "--reason", "d"], "close_setup");
     assert!(close.status.success(), "stderr={}", close.stderr);
 
-    let mixed = run_br(&workspace, ["close", &done, &blocked, "--json"], "close_mixed");
+    let mixed = run_br(
+        &workspace,
+        ["close", &done, &blocked, "--json"],
+        "close_mixed",
+    );
     assert_eq!(
         mixed.status.code(),
         Some(3),
@@ -443,7 +464,9 @@ fn force_closes_a_blocked_issue_and_reports_nothing_skipped() {
 
     let closed = run_br(
         &workspace,
-        ["close", &blocked, "--force", "--reason", "override", "--json"],
+        [
+            "close", &blocked, "--force", "--reason", "override", "--json",
+        ],
         "close_force",
     );
     assert_eq!(closed.status.code(), Some(0), "stderr={}", closed.stderr);

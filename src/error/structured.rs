@@ -869,10 +869,8 @@ pub fn skip_hint(skipped: &[SkippedTarget]) -> String {
     let mut sentences: Vec<String> = Vec::new();
 
     for code in SKIP_CODE_ORDER {
-        let group: Vec<&SkippedTarget> = skipped
-            .iter()
-            .filter(|s| s.reason.code() == code)
-            .collect();
+        let group: Vec<&SkippedTarget> =
+            skipped.iter().filter(|s| s.reason.code() == code).collect();
         if group.is_empty() {
             continue;
         }
@@ -901,7 +899,10 @@ pub fn skip_hint(skipped: &[SkippedTarget]) -> String {
         let ids: Vec<String> = group.iter().map(|s| s.id.clone()).collect();
         let listed: Vec<String> = ids.iter().take(MAX_LISTED).cloned().collect();
         let and_more = if ids.len() > listed.len() {
-            format!(" (and {} more; see context.skipped)", ids.len() - listed.len())
+            format!(
+                " (and {} more; see context.skipped)",
+                ids.len() - listed.len()
+            )
         } else {
             String::new()
         };
@@ -1633,7 +1634,10 @@ mod tests {
             ),
         ];
         let hint = skip_hint(&skipped);
-        assert!(hint.contains("t-a") && hint.contains("blocked by"), "{hint}");
+        assert!(
+            hint.contains("t-a") && hint.contains("blocked by"),
+            "{hint}"
+        );
         assert!(hint.contains("t-c") && hint.contains("br reopen"), "{hint}");
         assert!(hint.contains("t-d") && hint.contains("tombstone"), "{hint}");
         // A tombstone must never be advertised as reopenable work: it is a
