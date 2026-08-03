@@ -152,7 +152,7 @@ fn the_hint_and_the_warning_line_say_the_same_thing() {
     // The two surfaces disagreeing is the defect: the warning had the
     // truth, the hint replaced it with a generic string.
     let workspace = workspace();
-    let (_blocker, blocked) = create_blocked_pair(&workspace);
+    let (blocker, blocked) = create_blocked_pair(&workspace);
 
     let human = run_br(&workspace, ["close", &blocked], "close_blocked_human");
     assert_eq!(human.status.code(), Some(3), "stderr={}", human.stderr);
@@ -167,6 +167,14 @@ fn the_hint_and_the_warning_line_say_the_same_thing() {
         .map(|(_, rest)| rest.trim().to_string())
         .unwrap_or_else(|| panic!("no detail in warning line: {warning_line}"));
     assert!(detail.starts_with("blocked by"), "detail={detail}");
+    // The human line must name the blocker in its own right (mutation M10:
+    // degrading this to "blocked by dependencies" was invisible to every
+    // other assertion, because the hint gets the id from the remedy and the
+    // JSON from `blockers`).
+    assert!(
+        detail.contains(&blocker),
+        "the warning line must name the blocker {blocker}: {detail}"
+    );
 
     let hint = envelope(&human.stderr, "error")["hint"]
         .as_str()

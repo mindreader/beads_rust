@@ -749,6 +749,29 @@ mod tests {
     }
 
     #[test]
+    fn describe_for_blocked_names_the_blockers_it_was_given() {
+        // Found by mutation M10: replacing this arm with the generic
+        // "blocked by dependencies" passed every other test, because the
+        // blocker ids reach the hint through `remedy` and the JSON through
+        // `blockers()`. Nothing asserted that the line a HUMAN reads
+        // ("Warning: Skipped X: blocked by: ...") still names them — and
+        // that line is the one thing the old code got right.
+        let reason = SkipReason::Blocked {
+            blockers: vec!["t-b:open".to_string(), "t-c:in_progress".to_string()],
+        };
+        let described = reason.describe();
+        assert!(described.contains("t-b:open"), "{described}");
+        assert!(described.contains("t-c:in_progress"), "{described}");
+        // The generic phrasing is reserved for the case where the blockers
+        // genuinely could not be determined.
+        assert_ne!(described, "blocked by dependencies");
+        assert_eq!(
+            SkipReason::Blocked { blockers: vec![] }.describe(),
+            "blocked by dependencies"
+        );
+    }
+
+    #[test]
     fn describe_never_calls_a_tombstone_closed() {
         let described = SkipReason::AlreadyTerminal {
             status: Status::Tombstone,
