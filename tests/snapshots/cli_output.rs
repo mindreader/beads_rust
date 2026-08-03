@@ -1,5 +1,8 @@
 use super::common::cli::{BrWorkspace, run_br};
-use super::{create_issue, init_workspace, normalize_output, normalize_output_with_age_masking};
+use super::{
+    compose_invocation, create_issue, init_workspace, normalize_output,
+    normalize_output_with_age_masking,
+};
 use insta::assert_snapshot;
 
 #[cfg(feature = "self_update")]
@@ -42,12 +45,34 @@ fn snapshot_create_help() {
     assert_snapshot!("create_help", normalize_output(&output.stdout));
 }
 
+/// `br list` on a workspace with no issues.
+///
+/// This snapshot recorded ZERO BYTES. That expectation cannot fail: it is
+/// equally satisfied by `br list` working correctly, by `br list` dying
+/// before it printed anything, by its output going to stderr, and by the
+/// subcommand being deleted — every one of those exits 0 and prints nothing
+/// to stdout. It sat in the suite looking like a test of `br list`.
+///
+/// The silence itself is correct and is NOT a bug: `src/cli/commands/list.rs`
+/// keeps stdout empty here deliberately, to match the Go `bd` reference
+/// implementation (there are four conformance suites riding on that), and
+/// `br list | wc -l` scripts depend on it. So the fix is to state the
+/// expectation in a form that can fail, not to make the command speak.
+///
+/// The composed value pins all three facts — exit status, stdout, stderr —
+/// each labelled. `stdout: <empty>` is now an assertion. The stderr block
+/// pins that the command actually did its work (path validation, auto-import
+/// of zero records, blocked-cache rebuild) rather than exiting early, which
+/// is what makes "printed nothing" distinguishable from "did nothing".
 #[test]
 fn snapshot_list_empty() {
     let workspace = init_workspace();
     let output = run_br(&workspace, ["list"], "list_empty");
     assert!(output.status.success(), "list failed: {}", output.stderr);
-    assert_snapshot!("list_empty", normalize_output(&output.stdout));
+    assert_snapshot!(
+        "list_empty",
+        compose_invocation("br list", &output.stdout, &output.stderr, output.status)
+    );
 }
 
 #[test]

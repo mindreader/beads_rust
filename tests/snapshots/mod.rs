@@ -8,6 +8,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{self, Write};
+use std::process::ExitStatus;
 use std::sync::LazyLock;
 
 pub fn init_workspace() -> BrWorkspace {
@@ -19,6 +20,48 @@ pub fn init_workspace() -> BrWorkspace {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
     workspace
+}
+
+/// Turn the workspace into a git repository.
+///
+/// Identity is set locally (never `--global`) and `HOME` is already pointed
+/// at the workspace by the harness, so nothing here reads or writes the
+/// developer's own git configuration.
+pub fn git_init(workspace: &BrWorkspace) {
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "snapshots@example.invalid"][..],
+        &["config", "user.name", "Snapshot Fixture"][..],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace.root)
+            .output()
+            .expect("git must be available: fixtures that need a repository \
+                     cannot silently degrade to an empty result");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Record an empty commit carrying `message`.
+///
+/// Empty on purpose: the fixtures using this care about what the commit
+/// MESSAGE says (it names an issue ID), not about any file it touches.
+pub fn git_commit(workspace: &BrWorkspace, message: &str) {
+    let out = std::process::Command::new("git")
+        .args(["commit", "-q", "--allow-empty", "-m", message])
+        .current_dir(&workspace.root)
+        .output()
+        .expect("git commit runs");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 pub fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String {
@@ -633,6 +676,53 @@ pub fn normalize_output(output: &str) -> String {
     normalized
 }
 
+/// Render a whole invocation — exit status, stdout AND stderr — as one
+/// reviewable block.
+///
+/// WHY THIS EXISTS. A snapshot whose expected value is empty cannot fail.
+/// A zero-byte `.snap` is satisfied by the command behaving correctly, by
+/// the command crashing before it printed anything, by its output going to
+/// the wrong stream, and by the command being deleted — as long as the exit
+/// status stays zero. `list_empty.snap` was exactly that: nothing at all,
+/// recorded as ground truth, counted among the tests guarding `br list`.
+///
+/// Some commands genuinely print nothing (`br list` on an empty workspace
+/// is silent on purpose — see `src/cli/commands/list.rs`, where the silence
+/// is a deliberate conformance contract with the Go `bd` implementation, not
+/// an oversight). For those, the fix is not to make the command speak; it is
+/// to state the expectation in a form that CAN fail. This composes the three
+/// facts a reader needs, each explicitly labelled, so that "printed nothing"
+/// is an assertion rather than an absence — and so a reader can tell WHICH
+/// stream was empty.
+///
+/// Streams are labelled `<empty>` rather than left blank, deliberately: a
+/// composed value that renders as a blank region has reproduced the original
+/// problem in a fancier wrapper.
+pub fn compose_invocation(command: &str, stdout: &str, stderr: &str, status: ExitStatus) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "$ {command}");
+    let _ = writeln!(
+        out,
+        "exit: {}",
+        status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string())
+    );
+    for (label, stream) in [("stdout", stdout), ("stderr", stderr)] {
+        let normalized = normalize_output(stream);
+        let trimmed = normalized.trim_end();
+        if trimmed.is_empty() {
+            let _ = writeln!(out, "{label}: <empty>");
+        } else {
+            let _ = writeln!(out, "{label}:");
+            for line in trimmed.lines() {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// Like [`normalize_output`], but additionally masks the compact
 /// relative-age field so snapshots of freshly-created-then-listed
 /// issues don't embed a time-dependent `0s`/`1s`.
@@ -652,10 +742,25 @@ pub fn normalize_minimal(output: &str) -> String {
     normalized
 }
 
+/// Replace issue IDs inside a string ("bd-abc:open", "fix(bd-2p7): ...").
+///
+/// Uses the same [`looks_like_issue_id`] decision as the text normalizer,
+/// deliberately: this function is also applied to FREE TEXT (a commit
+/// message), and the blanket `\w+-[a-z0-9]{3,}` pattern it used to carry is
+/// the one that turned `--dry-run` into `ID-REDACTED` on the text side. One
+/// definition of "is an issue ID", two call sites — otherwise the bug just
+/// moves to whichever copy is not being looked at.
 fn normalize_id_string(s: &str) -> String {
-    // Normalize strings that contain issue IDs like "bd-abc:open" or "bd-xyz"
-    let id_re = Regex::new(r"\b[a-zA-Z0-9_]+-[a-z0-9]{3,}\b").expect("id regex");
-    id_re.replace_all(s, "ISSUE_ID").to_string()
+    ID_CANDIDATE_RE
+        .replace_all(s, |caps: &regex::Captures| {
+            let token = &caps[0];
+            if looks_like_issue_id(token) {
+                "ISSUE_ID".to_string()
+            } else {
+                token.to_string()
+            }
+        })
+        .to_string()
 }
 
 pub fn normalize_json(json: &Value) -> Value {
@@ -673,6 +778,23 @@ pub fn normalize_json(json: &Value) -> Value {
                         Value::String("TIMESTAMP".to_string())
                     }
                     "content_hash" => Value::String("HASH".to_string()),
+                    // A git object name is different on every run of the
+                    // fixture that produces it (empty commits differ by
+                    // committer timestamp), so it is masked rather than
+                    // recorded — but masked to a NAMED placeholder, never
+                    // dropped: the field's presence is part of the contract
+                    // `br orphans` owes its caller.
+                    "latest_commit" => Value::String("COMMIT_HASH".to_string()),
+                    // Free text that legitimately quotes an issue ID (a
+                    // commit message naming the bead it closed). The ID is
+                    // volatile; the rest of the sentence is the assertion.
+                    "latest_commit_message" => {
+                        if let Value::String(s) = value {
+                            Value::String(normalize_id_string(s))
+                        } else {
+                            normalize_json(value)
+                        }
+                    }
                     // Normalize actor/user fields that vary by system
                     "created_by" | "assignee" | "owner" | "author" | "deleted_by"
                     | "closed_by_session" | "actor" => {
