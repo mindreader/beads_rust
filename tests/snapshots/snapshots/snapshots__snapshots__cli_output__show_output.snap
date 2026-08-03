@@ -7,4 +7,4 @@ Owner: USERNAME · Type: task
 Creator: USERNAME
 Created: YYYY-MM-DD · Updated: YYYY-MM-DD
 
-Use [bold] for headings and [red]for errors.
+Use [bold] for headings and [red]errors[/red] for failures.

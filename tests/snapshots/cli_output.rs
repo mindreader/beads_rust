@@ -110,6 +110,13 @@ fn snapshot_list_with_issues() {
 /// bytes, and `no_snapshot_records_a_markup_escape_artifact` in
 /// tests/snapshot_hygiene.rs fails on the escape direction even if someone
 /// re-records.
+///
+/// The description is deliberately a full open/close tag pair around a word
+/// (`[red]errors[/red]`), the shape a markup parser is most likely to
+/// consume, while still reading as an ordinary sentence — so the recorded
+/// value can be reviewed as correct on its face. A snapshot whose expected
+/// text looks half-eaten even when it is right teaches the next reader to
+/// shrug at damage.
 #[test]
 fn snapshot_show_output() {
     let workspace = init_workspace();
@@ -119,7 +126,7 @@ fn snapshot_show_output() {
             "create",
             "Test issue with [brackets] in the title",
             "-d",
-            "Use [bold] for headings and [red]for errors.",
+            "Use [bold] for headings and [red]errors[/red] for failures.",
         ],
         "create_show",
     );
@@ -136,10 +143,13 @@ fn snapshot_show_output() {
     // Belt and braces, in the two directions this has actually failed:
     // asserted here as well as pinned in the snapshot, so a re-record cannot
     // quietly bless either one.
-    assert!(
-        normalized.contains("[bold]") && normalized.contains("[brackets]"),
-        "bracketed text was eaten between storage and screen:\n{normalized}"
-    );
+    for expected in ["[brackets]", "[bold]", "[red]errors[/red]"] {
+        assert!(
+            normalized.contains(expected),
+            "bracketed text {expected:?} was eaten between storage and \
+             screen:\n{normalized}"
+        );
+    }
     assert!(
         !normalized.contains("\\["),
         "a markup escape reached the screen; the stored text has no \
