@@ -512,24 +512,32 @@ fn e2e_lint_skips_types_without_required_sections() {
 
 // === Structured JSON Error Output Tests ===
 
-/// Parse structured error JSON from stderr.
-/// This handles the case where log lines may precede the JSON output.
+/// Parse the structured error envelope out of stderr.
+///
+/// **stderr is a mixed stream, not a JSON document, and never was one.** It
+/// carries, in order: tracing output and human diagnostics (`warning: ct-1 is
+/// already 'closed' ...`), the JSON envelope, and then whatever the command
+/// logs on the way out — a trailing `DEBUG ... Auto-flush` line, and, since the
+/// failure banner landed, `br: FAILED (CODE, exit N)`.
+///
+/// This helper used to try `from_str` on the whole stream and then on
+/// everything from the first `{` to EOF. That is tolerant of *leading* noise
+/// only — which is itself evidence that someone hit the leading case and
+/// patched the reader rather than fixing the premise. Any trailing byte broke
+/// it, and trailing bytes already occurred before the banner existed
+/// (`br close <already-closed> --json` logs after the envelope; `jq .` on that
+/// stderr exits 5 today).
+///
+/// So: find the envelope's opening brace and read exactly the *first* JSON
+/// value from there, ignoring anything after it. This is the idiom
+/// `tests/e2e_close_truth.rs::envelope` already uses; this helper simply
+/// predates it.
 fn parse_error_json(stderr: &str) -> Option<Value> {
-    // First try parsing the whole stderr as JSON
-    if let Ok(json) = serde_json::from_str(stderr) {
-        return Some(json);
-    }
-
-    // If that fails, look for a JSON object starting with '{'
-    // This handles cases where log lines precede the JSON output
-    if let Some(start) = stderr.find('{') {
-        let json_part = &stderr[start..];
-        if let Ok(json) = serde_json::from_str(json_part) {
-            return Some(json);
-        }
-    }
-
-    None
+    let start = stderr.find('{')?;
+    serde_json::Deserializer::from_str(&stderr[start..])
+        .into_iter()
+        .next()?
+        .ok()
 }
 
 /// Verify error JSON has required fields.
@@ -1214,4 +1222,108 @@ fn e2e_error_text_json_parity_validation() {
         verify_error_structure(&json),
         "JSON error should have required fields"
     );
+}
+
+// =============================================================================
+// The stderr contract: a MIXED STREAM, and never a single JSON document
+// =============================================================================
+
+/// stderr carries diagnostics, then the envelope, then trailing output — and it
+/// did so *before* the failure banner existed.
+///
+/// This is the premise the documented recipe in `docs/agent/ERRORS.md` used to
+/// rest on (`br ... 2>err.json; jq . err.json`). It has been false for as long
+/// as `close` has printed `warning:` lines and the sync layer has logged on its
+/// way out: `jq .` on that stderr exits 5. `parse_error_json` above was written
+/// tolerant of *leading* noise only, which is the fossil of someone hitting the
+/// first half of this and patching the reader instead of the premise.
+///
+/// The banner adds one more trailing line, so this test pins the whole shape at
+/// once: something before the envelope, the envelope, something after it, and
+/// the envelope still extractable. What must NOT regress is the extraction; the
+/// noise around it is not a defect to be removed, it is the contract.
+#[test]
+fn stderr_is_a_mixed_stream_not_a_json_document() {
+    let _log = common::test_log("stderr_is_a_mixed_stream_not_a_json_document");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init: {}", init.stderr);
+
+    // A blocked close: it logs before the envelope and exits nonzero, so the
+    // stream has content on both sides of the JSON.
+    let blocker = create_issue(&workspace, "blocker", "mixed_blocker");
+    let blocked = create_issue(&workspace, "blocked", "mixed_blocked");
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &blocked, &blocker],
+        "mixed_dep_add",
+    );
+    assert!(dep.status.success(), "dep add: {}", dep.stderr);
+
+    let result = run_br(
+        &workspace,
+        ["close", &blocked, "--json"],
+        "mixed_close_blocked",
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "a blocked close should exit 3: {}",
+        result.stderr
+    );
+
+    let stderr = &result.stderr;
+    let brace = stderr.find('{').expect("no envelope on stderr");
+    let close_brace = stderr.rfind('}').expect("no closing brace on stderr");
+
+    // 1. The premise is false: the whole stream is not a JSON document.
+    assert!(
+        serde_json::from_str::<Value>(stderr).is_err(),
+        "if stderr ever becomes a single JSON document, the docs and the \
+         helpers can be simplified — until then do not write a reader that \
+         assumes it: {stderr}"
+    );
+
+    // 2. There is non-JSON content BEFORE the envelope.
+    assert!(
+        brace > 0 && !stderr[..brace].trim().is_empty(),
+        "expected diagnostics before the envelope: {stderr}"
+    );
+
+    // 3. And AFTER it — the banner, plus whatever the command logs on the way
+    //    out. This is the half the old helper got wrong.
+    assert!(
+        !stderr[close_brace + 1..].trim().is_empty(),
+        "expected trailing content after the envelope: {stderr}"
+    );
+
+    // 4. The envelope is still extractable, which is the only thing a consumer
+    //    needs to be true. This assertion is deliberately BEFORE the banner
+    //    check: it fails with the old leading-noise-only helper even on a
+    //    binary with no banner at all, which is how the helper bug is shown to
+    //    be pre-existing rather than banner-induced.
+    let json = parse_error_json(stderr).expect("envelope must survive the noise around it");
+    assert_eq!(json["error"]["code"], "NOTHING_TO_DO");
+    assert!(verify_error_structure(&json), "envelope shape: {json}");
+
+    // 5. And the banner is the last line of that stream.
+    assert!(
+        stderr
+            .lines()
+            .next_back()
+            .is_some_and(|line| line.contains("FAILED (NOTHING_TO_DO, exit 3)")),
+        "the banner must be the last line of the mixed stream: {stderr}"
+    );
+}
+
+/// Create an issue and return its id.
+fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String {
+    let out = run_br(workspace, ["create", title, "--json"], label);
+    assert!(out.status.success(), "create failed: {}", out.stderr);
+    let payload = extract_json_payload(&out.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("create json");
+    json["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no id in create output: {json}"))
+        .to_string()
 }
