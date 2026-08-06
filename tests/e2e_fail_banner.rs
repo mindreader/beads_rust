@@ -230,6 +230,22 @@ fn where_without_a_beads_dir_gets_the_banner() {
     );
 }
 
+/// Requirement 5, `br config get` on a key that is not set.
+///
+/// A quiet exit-1 path with no envelope at all: it prints a one-line message
+/// and exits. Nothing about it resembles the JSON failures above, which is
+/// exactly why it needs its own assertion rather than an assumption that
+/// "`handle_error` covers everything".
+#[test]
+fn config_get_on_a_missing_key_gets_the_banner() {
+    let workspace = BrWorkspace::new();
+    init(&workspace);
+
+    let out = sh(&workspace, r#""$BR" config get nosuchkey 2>&1 | tail -1"#);
+
+    assert_eq!(last_line(&out), "br: FAILED (CONFIG_KEY_NOT_FOUND, exit 1)");
+}
+
 /// Requirement 5, `br lint`'s computed exit code.
 #[test]
 fn lint_warnings_get_the_banner() {
