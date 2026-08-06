@@ -1,0 +1,348 @@
+name: CI
+
+# Gate on pull requests targeting main. A workflow that only reacts to `push`
+# would run *after* a PR has already been merged, which gates nothing — by
+# the time it goes red the bad commit is already on main. `pull_request`
+# runs against the merge of the PR's head into main, before merge is
+# possible, and is what branch protection's "required status checks" hooks
+# into (checks are matched by job name against the pull_request event).
+#
+# workflow_dispatch is included purely so a human can manually re-run this
+# exact workflow (e.g. once GitHub Actions comes back from an outage)
+# without needing a synthetic commit.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Least privilege: nothing in this workflow needs to write to the repo,
+# comment on the PR, or touch packages/deployments. If a future job needs
+# more (e.g. posting a coverage comment), grant it explicitly on that job,
+# not here.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same PR so force-pushes don't queue up
+# redundant multi-shard test matrices.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation artifacts don't survive across CI runs the way
+  # they do on a dev machine (each run is a fresh checkout/cache restore),
+  # so paying its bookkeeping cost buys nothing here and only bloats the
+  # cache. Off for CI; devenv leaves it at cargo's default for local dev.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # cargo fmt --check
+  #
+  # NOTE (read before flipping this to "required" in branch protection):
+  # as of this workflow being added, `cargo fmt --all -- --check` FAILS
+  # against main's current tree — there is a pre-existing, unrelated
+  # formatting backlog (see scripts/ci-local.sh's own comment, and the
+  # accompanying docs/CI_BRANCH_PROTECTION.md). This job is written to
+  # report that honestly (no suppression), which means it will show red
+  # on this very PR. Whether to include "fmt" in the required-checks list
+  # now (blocking all merges until the backlog is fixed) or land it
+  # unrequired until a follow-up formats the tree is a judgment call left
+  # to whoever configures branch protection — both invocations are given
+  # in docs/CI_BRANCH_PROTECTION.md.
+  # ---------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euxo pipefail
+          # rust-toolchain.toml pins `channel = "nightly"` with the
+          # rustfmt/clippy components; `rustup show` auto-installs
+          # whatever toolchain+components that file names the first time
+          # it's invoked in this checkout. `edition = "2024"` needs a
+          # nightly recent enough to support it, which is why we don't
+          # pin an older stable toolchain here instead — see the top-level
+          # decision note in the `build` job below for the full rationale.
+          rustup show
+          rustup component add rustfmt
+          cargo --version
+          rustfmt --version
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------
+  # cargo clippy, both feature configurations the tree actually cares
+  # about (mirrors scripts/ci-local.sh and the warning in devenv.nix about
+  # the two invocations needing to both stay clean). No `-A` flags here
+  # beyond what Cargo.toml's [lints] table already carries; `-D warnings`
+  # additionally denies plain rustc warnings that aren't clippy lints.
+  # ---------------------------------------------------------------------
+  clippy:
+    name: clippy (${{ matrix.feature-profile.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        feature-profile:
+          - name: all-features
+            flag: --all-features
+          - name: no-default-features
+            flag: --no-default-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euxo pipefail
+          rustup show
+          rustup component add clippy
+          cargo --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ matrix.feature-profile.name }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-${{ matrix.feature-profile.name }}-
+
+      - name: cargo clippy ${{ matrix.feature-profile.flag }}
+        env:
+          FEATURE_FLAG: ${{ matrix.feature-profile.flag }}
+        run: cargo clippy --locked --all-targets "$FEATURE_FLAG" -- -D warnings
+
+  # ---------------------------------------------------------------------
+  # cargo build
+  #
+  # Deliberately the dev profile, not --release: the release profile in
+  # Cargo.toml turns on LTO + codegen-units=1, which is a correctness/size
+  # optimization for shipped binaries, not something a per-PR gate should
+  # pay for on every push. If a release-profile regression needs catching
+  # (e.g. an LTO-only miscompile), that belongs in a separate, slower,
+  # non-blocking workflow — not this one.
+  #
+  # Toolchain decision (applies to every job in this file): devenv.nix
+  # provisions the compiler via fenix (a *floating* `fenix.latest`
+  # resolved against the pinned devenv.lock), plus pkg-config/openssl/
+  # sqlite/gcc as system packages. We do NOT reproduce devenv in CI:
+  #   - rust-toolchain.toml already pins `channel = "nightly"` with the
+  #     components this repo needs; GitHub's hosted runners ship rustup,
+  #     which auto-installs whatever that file names on first use. That
+  #     gets us the same "nightly + rustfmt + clippy" contract devenv
+  #     promises, without needing devenv's Nix machinery in CI at all.
+  #   - rusqlite is built with the `bundled` feature (see Cargo.toml),
+  #     i.e. it compiles its own vendored SQLite from source — no system
+  #     libsqlite3-dev needed.
+  #   - self_update is built with `rustls` (not `native-tls`), so no
+  #     system OpenSSL headers are needed either.
+  #   - what's left (a C compiler + pkg-config, for the handful of sys
+  #     crates that still shell out to `cc`) ubuntu-latest's runner image
+  #     ships preinstalled (build-essential, pkg-config).
+  # If a future dependency actually needs a system library devenv
+  # provides and the runner image doesn't have it, install it explicitly
+  # in this job with `apt-get install -y <pkg>` rather than reaching for
+  # devenv/Nix in CI — don't let this comment go stale if that happens.
+  # ---------------------------------------------------------------------
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euxo pipefail
+          rustup show
+          cargo --version
+          rustc --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: cargo build --all-targets --all-features
+        run: cargo build --locked --all-targets --all-features
+
+  # ---------------------------------------------------------------------
+  # Integration test suite, sharded.
+  #
+  # tests/*.rs is 105 files (each its own compiled+linked test binary via
+  # assert_cmd against the built `br` binary) plus two directories of
+  # shared test support (tests/common/, tests/fixtures/, tests/snapshots/)
+  # that are not standalone targets. A prior attempt to run the whole
+  # suite as a single blocking `cargo test` call took long enough to get
+  # the calling process killed by a signal before it finished — so this
+  # is split across 4 parallel shards, each compiling+running only its
+  # slice, with a deliberate per-shard timeout instead of hoping it
+  # finishes.
+  #
+  # The shard membership is computed from `tests/*.rs` at run time (sorted
+  # filename list, index modulo shard count) rather than hardcoded, so
+  # adding or removing a test file doesn't require editing this workflow.
+  # The candidate filenames are looked up from the checked-out tree and
+  # passed to `cargo` as literal argv elements via a bash array — never
+  # substituted into a string that a shell re-parses — specifically so a
+  # PR that adds a test file with a shell-metacharacter-laden name (a
+  # real, if exotic, attacker-controlled-input surface: filenames are
+  # part of the PR diff) can't turn "select which tests to run" into
+  # "run arbitrary shell". Same reasoning as not splicing
+  # branch/tag/title strings into `run:` blocks elsewhere in this repo's
+  # automation — untrusted data reaches a shell through structured
+  # argv/env, never through string interpolation.
+  #
+  # `#[ignore]`d tests (the bench_*/benchmark_*.rs performance-comparison
+  # suites) are not run here — `cargo test` skips them by default, and
+  # they are explicitly documented in-file as opt-in
+  # (`cargo test ... -- --ignored`). They still get *compiled* as part of
+  # each shard that contains them, which is enough to catch a build
+  # break in that code; running them is a separate, much slower concern
+  # for a scheduled/manual workflow, not a per-PR gate.
+  #
+  # Feature profile: this crate has exactly one optional feature
+  # (`self_update`, on by default), and scripts/ci-local.sh runs the
+  # integration suite under BOTH `--all-features` and
+  # `--no-default-features` as two separate, deliberate passes. Matching
+  # that here (rather than only covering `--all-features`) is a decision
+  # made explicitly, not a default: see docs/CI_BRANCH_PROTECTION.md's
+  # "does this workflow agree with scripts/ci-local.sh" comparison table
+  # for why testing only one profile would make this gate a *weaker*
+  # signal than the pre-push script it's supposed to formalize.
+  # ---------------------------------------------------------------------
+  test:
+    name: test (shard ${{ matrix.shard }}/4, ${{ matrix.feature-profile.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+        feature-profile:
+          - name: all-features
+            flag: --all-features
+          - name: no-default-features
+            flag: --no-default-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euxo pipefail
+          rustup show
+          cargo --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-shard-${{ matrix.shard }}-${{ matrix.feature-profile.name }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-shard-${{ matrix.shard }}-${{ matrix.feature-profile.name }}-
+
+      - name: Run this shard's integration tests
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: 4
+          FEATURE_FLAG: ${{ matrix.feature-profile.flag }}
+        run: |
+          set -euo pipefail
+          mapfile -t all_tests < <(find tests -maxdepth 1 -name '*.rs' -printf '%f\n' | sed 's/\.rs$//' | sort)
+          total=${#all_tests[@]}
+          if (( total == 0 )); then
+            echo "no test files found under tests/ — refusing to report a spuriously-green shard" >&2
+            exit 1
+          fi
+          args=(test --locked "$FEATURE_FLAG")
+          selected=()
+          for i in "${!all_tests[@]}"; do
+            if (( i % SHARD_TOTAL == SHARD_INDEX - 1 )); then
+              args+=(--test "${all_tests[$i]}")
+              selected+=("${all_tests[$i]}")
+            fi
+          done
+          echo "shard $SHARD_INDEX/$SHARD_TOTAL ($FEATURE_FLAG): ${#selected[@]} of $total test binaries:"
+          printf '  - %s\n' "${selected[@]}"
+          cargo "${args[@]}"
+
+  # ---------------------------------------------------------------------
+  # Unit tests (`#[cfg(test)]` modules inside src/) and doc tests. These
+  # live outside tests/*.rs so the shard job above never touches them.
+  #
+  # scripts/ci-local.sh's doc-test pass (`cargo test --doc`, no feature
+  # flag) is equivalent to `--all-features` today only because
+  # `self_update` — the crate's one optional feature — is already on by
+  # default; it does not also run doc tests under
+  # `--no-default-features`. This job runs both profiles for both `--lib`
+  # and `--doc`, which is intentionally a superset of what the local
+  # script checks (see the comparison table in
+  # docs/CI_BRANCH_PROTECTION.md) — more coverage here is not a hazard,
+  # unlike the reverse.
+  # ---------------------------------------------------------------------
+  test-lib-and-doc:
+    name: test (lib + doctests, ${{ matrix.feature-profile.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        feature-profile:
+          - name: all-features
+            flag: --all-features
+          - name: no-default-features
+            flag: --no-default-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euxo pipefail
+          rustup show
+          cargo --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-libdoc-${{ matrix.feature-profile.name }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-libdoc-${{ matrix.feature-profile.name }}-
+
+      - name: cargo test --lib
+        env:
+          FEATURE_FLAG: ${{ matrix.feature-profile.flag }}
+        run: cargo test --locked "$FEATURE_FLAG" --lib
+
+      - name: cargo test --doc
+        env:
+          FEATURE_FLAG: ${{ matrix.feature-profile.flag }}
+        run: cargo test --locked "$FEATURE_FLAG" --doc
