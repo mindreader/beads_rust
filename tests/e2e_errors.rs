@@ -1259,6 +1259,14 @@ fn e2e_error_text_json_parity_validation() {
 /// you need it.
 #[test]
 fn envelope_is_readable_under_every_leading_noise_shape() {
+    struct Shape {
+        name: &'static str,
+        args: Vec<String>,
+        warnings: usize,
+        code: &'static str,
+        exit: i32,
+    }
+
     let _log = common::test_log("envelope_is_readable_under_every_leading_noise_shape");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "init");
@@ -1278,14 +1286,6 @@ fn envelope_is_readable_under_every_leading_noise_shape() {
     let closed = create_issue(&workspace, "already closed", "noise_closed");
     let first = run_br(&workspace, ["close", &closed], "noise_close_first");
     assert!(first.status.success(), "first close: {}", first.stderr);
-
-    struct Shape {
-        name: &'static str,
-        args: Vec<String>,
-        warnings: usize,
-        code: &'static str,
-        exit: i32,
-    }
 
     let shapes = vec![
         Shape {
