@@ -1316,6 +1316,66 @@ fn stderr_is_a_mixed_stream_not_a_json_document() {
     );
 }
 
+/// The trailing-noise half of the contract, demonstrated with NO banner in the
+/// picture at all — this exit is 0.
+///
+/// `br close <already-closed> --json` prints a `warning:` line, then a
+/// `notice` envelope, then a `DEBUG ... Auto-flush` line from the sync layer on
+/// the way out. That trailing line has been there far longer than the failure
+/// banner, and it is why `jq . err.json` — the recipe `docs/agent/ERRORS.md`
+/// used to document — exits 5 on a perfectly ordinary command.
+///
+/// So this test earns the `parse_error_json` fix independently of the banner:
+/// revert the helper to its leading-noise-only form and it fails here even on a
+/// binary built before the banner existed (verified both ways).
+#[test]
+fn envelope_extraction_survives_trailing_logs_with_no_banner() {
+    let _log = common::test_log("envelope_extraction_survives_trailing_logs_with_no_banner");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init: {}", init.stderr);
+
+    let id = create_issue(&workspace, "already closed thing", "trailing_create");
+    let first = run_br(&workspace, ["close", &id], "trailing_close_first");
+    assert!(first.status.success(), "first close: {}", first.stderr);
+
+    let result = run_br(&workspace, ["close", &id, "--json"], "trailing_close_again");
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "closing an already-closed issue is not a failure: {}",
+        result.stderr
+    );
+
+    let stderr = &result.stderr;
+
+    // No banner: this exit is 0. Whatever trails the envelope here is not ours.
+    assert!(
+        !stderr.contains("FAILED ("),
+        "exit 0 must not carry a failure banner: {stderr}"
+    );
+
+    // Something trails the envelope anyway.
+    assert!(
+        !stderr.trim_end().ends_with('}'),
+        "expected the sync layer to log after the envelope; if this ever stops \
+         being true, trailing-tolerance in parse_error_json is still required \
+         by the banner, but this test no longer proves it independently: \
+         {stderr}"
+    );
+
+    // The documented recipe's premise, false without any help from us.
+    assert!(
+        serde_json::from_str::<Value>(stderr).is_err(),
+        "stderr parsed as a single JSON document, which docs/agent/ERRORS.md \
+         used to assume: {stderr}"
+    );
+
+    // And the envelope is extractable regardless.
+    let json = parse_error_json(stderr).expect("envelope must survive the trailing logs");
+    assert_eq!(json["notice"]["code"], "ALREADY_SATISFIED");
+}
+
 /// Create an issue and return its id.
 fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String {
     let out = run_br(workspace, ["create", title, "--json"], label);
