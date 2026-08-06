@@ -242,13 +242,19 @@ echo "br_status=$?"
 echo "warnings=$(grep -c '^warning:' err.json)"
 echo "last=$(tail -1 err.json)"
 
-# documented as CORRECT
-echo "right_sed=$(sed -n '/{{/,/^}}$/p' err.json | jq -r .error.code)"
-echo "right_sed_status=$?"
-python3 -c 'import json,sys
+# documented as CORRECT.
+#
+# The assignment form is load-bearing: `x=$(cmd)` propagates cmd's status,
+# while `echo "x=$(cmd)"` reports *echo's* 0 and throws the real status away.
+# Written the echo way, right_*_status could never be nonzero and the check
+# was dead -- which mattered, because jq prints the extracted code and *then*
+# dies on the trailing byte, so the value alone does not discriminate.
+right_sed=$(sed -n '/{{/,/^}}$/p' err.json | jq -r .error.code); echo "right_sed_status=$?"
+echo "right_sed=$right_sed"
+right_python=$(python3 -c 'import json,sys
 s=sys.stdin.read()
-print("right_python="+json.JSONDecoder().raw_decode(s[s.index("{{"):])[0]["error"]["code"])' < err.json
-echo "right_python_status=$?"
+print(json.JSONDecoder().raw_decode(s[s.index("{{"):])[0]["error"]["code"])' < err.json); echo "right_python_status=$?"
+echo "right_python=$right_python"
 
 # documented as WRONG
 jq . err.json >/dev/null 2>&1;                       echo "wrong_whole=$?"

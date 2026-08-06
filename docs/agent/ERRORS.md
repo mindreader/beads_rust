@@ -61,6 +61,20 @@ br ... | tail -3; status=${PIPESTATUS[0]}   # bash
 Seeing `br: FAILED (...)` in a log is *not* evidence that the surrounding
 script noticed.
 
+Command substitution loses the status the same way, and less visibly:
+
+```bash
+code=$(br show bad --json | jq -r .error.code); echo "$?"   # jq's status: propagates
+echo "code=$(br show bad --json | jq -r .error.code)"       # echo's 0: status thrown away
+```
+
+An assignment adopts the substituted command's status; any other command
+wrapping the substitution reports its own. This bit the test suite for this
+very feature: a check written the second way could not fail, and it went
+unnoticed because the *value* still looked right — `jq` prints what it managed
+to extract before it dies on the trailing byte, so a wrong recipe yields the
+right answer plus a nonzero status nobody was reading.
+
 ## Reading the envelope: stderr is a mixed stream, and never was one document
 
 **stderr carries human diagnostics, then the JSON error envelope, then trailing
