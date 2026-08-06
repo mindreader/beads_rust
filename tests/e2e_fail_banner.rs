@@ -75,6 +75,18 @@ fn last_line(out: &Output) -> String {
     stdout_of(out).trim_end_matches('\n').to_string()
 }
 
+/// Create an issue and return its id.
+fn create_issue(workspace: &BrWorkspace, title: &str) -> String {
+    let out = run_br(workspace, ["create", title, "--json"], "create");
+    assert!(out.status.success(), "create failed: {}", out.stderr);
+    let value: serde_json::Value =
+        serde_json::from_str(&common::cli::extract_json_payload(&out.stdout)).expect("create json");
+    value["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no id in create output: {value}"))
+        .to_string()
+}
+
 fn init(workspace: &BrWorkspace) {
     let init = run_br(workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -195,6 +207,105 @@ fn jq_still_parses_stdout_while_the_banner_is_emitted() {
         "the banner was not emitted in this run, so the jq assertion above \
          proved nothing: {banner:?}"
     );
+}
+
+/// The recipes in `docs/agent/ERRORS.md` are executed here, not just written.
+///
+/// A documentation fix for a parsing hazard is worth nothing if the replacement
+/// recipe is also broken, and one of the obvious replacements *is*:
+/// `sed -n '/{/,$p'` is unbounded at the end, so it survives leading warnings
+/// and then hands `jq` the trailing banner line. It works on every release
+/// before the banner, which is exactly the kind of recipe that gets copied.
+///
+/// So each documented form runs against a real failing invocation with the full
+/// noise profile — two contention warnings, the envelope, the banner — and the
+/// right ones must extract the code while the wrong ones must fail. If a future
+/// `jq` starts tolerating trailing data, or the envelope stops being
+/// pretty-printed, this test says so instead of the docs quietly rotting.
+#[test]
+fn the_documented_envelope_recipes_work_and_the_documented_traps_fail() {
+    let workspace = BrWorkspace::new();
+    init(&workspace);
+
+    // The worst realistic shape: repeated ids produce repeated warnings, and a
+    // blocked id makes the whole thing exit nonzero so the banner is present.
+    let blocker = create_issue(&workspace, "blocker");
+    let blocked = create_issue(&workspace, "blocked");
+    let closed = create_issue(&workspace, "already closed");
+    let script = format!(
+        r#"set -e
+"$BR" dep add {blocked} {blocker} >/dev/null 2>&1
+"$BR" close {closed} >/dev/null 2>&1
+set +e
+"$BR" close {closed} {closed} {blocked} --json >/dev/null 2>err.json
+echo "br_status=$?"
+echo "warnings=$(grep -c '^warning:' err.json)"
+echo "last=$(tail -1 err.json)"
+
+# documented as CORRECT
+echo "right_sed=$(sed -n '/{{/,/^}}$/p' err.json | jq -r .error.code)"
+echo "right_sed_status=$?"
+python3 -c 'import json,sys
+s=sys.stdin.read()
+print("right_python="+json.JSONDecoder().raw_decode(s[s.index("{{"):])[0]["error"]["code"])' < err.json
+echo "right_python_status=$?"
+
+# documented as WRONG
+jq . err.json >/dev/null 2>&1;                       echo "wrong_whole=$?"
+sed -n '/{{/,$p' err.json | jq . >/dev/null 2>&1;      echo "wrong_unbounded=$?"
+tail -n +2 err.json | jq . >/dev/null 2>&1;          echo "wrong_skip_one=$?"
+grep -v '^warning:' err.json | jq . >/dev/null 2>&1; echo "wrong_case_strip=$?"
+"#
+    );
+    let out = sh(&workspace, &script);
+    let text = stdout_of(&out);
+    let field = |key: &str| -> String {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} in recipe output: {text}"))
+            .to_string()
+    };
+
+    // The fixture really is the hostile shape, or the rest proves nothing.
+    assert_eq!(field("br_status"), "3", "fixture exit code: {text}");
+    assert_eq!(
+        field("warnings"),
+        "2",
+        "fixture must carry TWO leading warnings, which is what defeats a \
+         fixed-line skip: {text}"
+    );
+    assert!(
+        field("last").contains("br: FAILED (NOTHING_TO_DO, exit 3)"),
+        "fixture must carry the trailing banner, which is what defeats an \
+         end-unbounded scan: {text}"
+    );
+
+    // The documented recipes extract the code.
+    assert_eq!(field("right_sed"), "NOTHING_TO_DO", "sed window form: {text}");
+    assert_eq!(field("right_sed_status"), "0", "sed window status: {text}");
+    assert_eq!(
+        field("right_python"),
+        "NOTHING_TO_DO",
+        "raw_decode form: {text}"
+    );
+    assert_eq!(field("right_python_status"), "0", "raw_decode status: {text}");
+
+    // And the documented traps really are traps. Asserted nonzero rather than
+    // 5 so this does not become a test of jq's exit-code scheme.
+    for trap in [
+        "wrong_whole",
+        "wrong_unbounded",
+        "wrong_skip_one",
+        "wrong_case_strip",
+    ] {
+        assert_ne!(
+            field(trap),
+            "0",
+            "{trap} is documented as WRONG but succeeded; if a tool got more \
+             tolerant, the docs should say so rather than warn about a hazard \
+             that no longer exists: {text}"
+        );
+    }
 }
 
 /// Requirement 5, non-`handle_error` paths: a clap usage error.

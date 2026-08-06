@@ -61,12 +61,58 @@ br ... | tail -3; status=${PIPESTATUS[0]}   # bash
 Seeing `br: FAILED (...)` in a log is *not* evidence that the surrounding
 script noticed.
 
-Example (captured with stderr redirection):
+## Reading the envelope: stderr is a mixed stream, and never was one document
+
+**stderr carries human diagnostics, then the JSON error envelope, then trailing
+output including the banner. Do not parse stderr as a single JSON document; it
+never was one.** To read the envelope, **scan to the first `{` and take the
+first JSON value from there — bounded at both ends.**
 
 ```bash
-br show bd-NOTEXIST --format json > /dev/null 2>err.json || true
-cat err.json | jq .
+br close <closed-id> <closed-id> <blocked-id> --json > /dev/null 2>err.json || true
+
+sed -n '/{/,/^}$/p' err.json | jq .      # correct: first '{' to the envelope's closing brace
+
+# language-agnostic form of the same rule, for anything that is not a shell:
+python3 -c 'import json,sys; s=sys.stdin.read()
+print(json.JSONDecoder().raw_decode(s[s.index("{"):])[0]["error"]["code"])' < err.json
+
+jq . err.json                            # WRONG: exits 5 whenever anything precedes the envelope
+sed -n '/{/,$p' err.json | jq .          # WRONG: unbounded at the end, so the banner breaks it
+tail -n +2 err.json | jq .               # WRONG: there can be more than one leading line
+grep -v '^warning:' err.json | jq .      # WRONG: the other generator writes capital `Warning:`
 ```
+
+Every line above was measured, not reasoned about: on the invocation shown all
+four wrong forms fail (exit 5 under jq/jaq) and both right forms print
+`NOTHING_TO_DO`. `tests/e2e_fail_banner.rs` executes all six against a real
+failing command, so a recipe that rots here fails the suite. `sed -n '/{/,$p'` is worth calling out because it *looks*
+right and works on any release before the banner: it is unbounded at the end,
+so it now hands jq a trailing non-JSON line. Bound both ends or use a real
+parser's `raw_decode`.
+
+This is not new and it is not caused by the banner. `br close` prints a
+`warning:` line per already-closed id, the sync layer logs on the way out, and
+either one breaks a whole-stream parse on its own. An earlier reader in this
+repo was patched to skip *leading* noise and left intact for trailing noise,
+which is how it stayed hidden: the case that a natural test picks — an envelope
+with nothing around it — passes with a broken reader.
+
+It matters most where it is least visible. The repeated warning is a
+*contention* warning ("another agent may be working on this issue"), so a naive
+whole-stream parse fails exactly on the concurrency paths — two agents colliding
+on one bead — which is when the precise error detail matters most and when no
+human is watching the scrollback.
+
+**Prefer the banner when all you need is *what failed*.** One line, at a known
+position (last), with a fixed shape, carrying the code and the exit status:
+
+```bash
+code=$(br ... 2>&1 >/dev/null | tail -1)    # br: FAILED (NOTHING_TO_DO, exit 3)
+```
+
+Read the envelope when you need the *detail* — `context`, `hint`, `retryable` —
+not to discover that something went wrong.
 
 Shape:
 
