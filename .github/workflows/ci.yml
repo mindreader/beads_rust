@@ -221,6 +221,14 @@ jobs:
   # break in that code; running them is a separate, much slower concern
   # for a scheduled/manual workflow, not a per-PR gate.
   #
+  # Whichever shard draws tests/e2e_installer.rs will be the long pole:
+  # e2e_installer_full_install_and_verify shells out to install.sh, which
+  # (network permitting, which it will be here) falls back to a real
+  # `cargo build --release` of a fetched source tree when no matching
+  # prebuilt binary exists — measured at several minutes by itself. The
+  # 45-minute budget below accounts for that; see the "measured hazard"
+  # note in docs/CI_BRANCH_PROTECTION.md.
+  #
   # Feature profile: this crate has exactly one optional feature
   # (`self_update`, on by default), and scripts/ci-local.sh runs the
   # integration suite under BOTH `--all-features` and

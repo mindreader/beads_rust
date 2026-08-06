@@ -227,6 +227,26 @@ class of hazard (attacker-controlled data reaching a shell) as splicing
 step in this workflow does the latter; every value that originates from the
 PR/event context and is used in a script is passed through `env:` first.
 
+**Measured hazard, not fixed by this PR:** `tests/e2e_installer.rs`
+contains `e2e_installer_full_install_and_verify`, which (when both `bash`
+and network are available, which is the normal case on a GitHub-hosted
+runner) shells out to this repo's `install.sh`, which — because no
+prebuilt release binary matches this checkout — falls back to a full
+`cargo build --release` of a fetched source tree. In this sandbox that
+fetched tree turned out to be a much larger, unrelated dependency graph
+(pulling in crates this repo's own `Cargo.toml` does not use at all, e.g.
+`fsqlite`/`asupersync`/`mimalloc`) and took several minutes by itself with
+LTO + `codegen-units=1`. Whichever shard draws `e2e_installer.rs` will be
+the long pole of the `test` job by a wide margin, and it depends on
+network access to a resource outside this repo's control — a source of
+both slowness and potential flakiness that has nothing to do with whether
+the PR under test is correct. This PR does not change that test (it is
+out of scope for a CI-gate PR to also start editing the test suite's
+behavior), but the shard timeout budget below accounts for it, and a
+reasonable follow-up would be gating that one test behind the same
+network-required `#[ignore]` convention `e2e_installer_version_resolution_github_api`
+in the same file already uses.
+
 ## Does `ci.yml` agree with `scripts/ci-local.sh` about what "passing" means?
 
 The project leader asked for this comparison explicitly, including the rows
@@ -268,19 +288,34 @@ using the same nightly toolchain the workflow installs, via `devenv shell`):
 - `cargo fmt --all -- --check` — **exit 1**, ~2854 lines of diff. Backlog is
   real, not inferred from the missing-workflow situation.
 - `cargo check --all-targets --all-features` — exit 0, ~2 min.
-- `cargo build --locked --all-targets --all-features` — exit 0.
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` —
   exit 0, ~58s.
 - `cargo clippy --locked --all-targets --no-default-features -- -D
   warnings` — exit 0, ~67s.
-- `cargo build --locked --all-targets --no-default-features` — exit 0.
-- `cargo test --locked --all-features --lib` — exit 0.
-- `cargo test --locked --all-features --doc` — exit 0.
-- `cargo test --locked --all-features` (full 105-file integration suite,
-  unsharded, to establish ground truth before trusting the sharded version)
-  — exit 0.
-- `cargo test --locked --no-default-features` (full suite) — exit 0.
-- `cargo test --locked --no-default-features --doc` — exit 0.
+- `cargo build --locked --all-targets --no-default-features` — exit 0,
+  ~6m23s cold (this and everything below ran serially, back to back, in
+  one 46m39s wall-clock chain, so most of these timings include queueing
+  behind the step before them, not isolated cold-cache time).
+- `cargo test --locked --all-features` (unsharded — every one of the 105
+  `tests/*.rs` files, plus `--lib` and the crate's doctests, since a bare
+  `cargo test` with no `--lib`/`--test`/`--doc` filter runs all three) —
+  **exit 0, explicitly observed** (`EXIT(test all-features full)=0`),
+  including the `Doc-tests beads_rust ... 0 failed` block inside that same
+  run. This entails (does not just argue) that `cargo build --locked
+  --all-targets --all-features`, `cargo test --lib --all-features`, and
+  `cargo test --doc --all-features` all pass too — cargo cannot run tests
+  it hasn't first built, and the full unfiltered run exercises the same
+  lib-test and doc-test code the narrower invocations would.
+- `cargo test --locked --no-default-features` (full suite, same scope as
+  above) — **exit 0, explicitly observed**
+  (`EXIT(test no-default-features full)=0`), same entailment for `build`/
+  `--lib`/`--doc` under this feature profile.
+- `cargo test --locked --no-default-features --doc` — exit 0, explicitly
+  observed (redundant with the point above, run anyway; no new
+  information, just confirmation).
+- This run is also what surfaced the `e2e_installer_full_install_and_verify`
+  network+nested-build hazard documented earlier in this file — found by
+  running the real suite, not inferred from reading the test names.
 - The workflow YAML parses under a real parser (`yq`, mikefarah/yq v4) and
   is accepted by `actionlint` v1.7.12 with zero findings.
 - **Positive control on the parser/linter themselves**: both `yq` and
