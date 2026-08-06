@@ -388,6 +388,46 @@ fn a_fatal_panic_still_names_itself() {
     );
 }
 
+/// Pending stdout bytes must be flushed BEFORE the banner is written.
+///
+/// stdout is a `LineWriter`, so it only ever holds bytes when a printer stopped
+/// mid-line — and no command in the tree does that *and then fails*, so the
+/// flush inside `emit_exit_banner` is unobservable through any real command.
+/// That is exactly the kind of "it's obviously fine" code this feature exists to
+/// distrust, so `BD_PANIC_FOR_TEST=partial-stdout` manufactures the condition:
+/// an unterminated stdout line, then a fatal panic.
+///
+/// Without the flush, std's exit cleanup emits those bytes *after* the banner
+/// under `2>&1` and the surviving line is the fragment instead. `ends_with`
+/// rather than `==` because the fragment has no newline, so the banner
+/// legitimately continues that same line — the assertion is about which bytes
+/// come last, which is the whole point.
+#[test]
+fn pending_stdout_is_flushed_before_the_banner() {
+    let workspace = BrWorkspace::new();
+
+    let out = sh(
+        &workspace,
+        r#"BD_PANIC_FOR_TEST=partial-stdout "$BR" list 2>&1 | tail -1"#,
+    );
+    let line = last_line(&out);
+    let banner = format!(
+        "br: FAILED (PANIC, exit {})",
+        beads_rust::exit::panic_exit_status()
+    );
+
+    assert!(
+        line.ends_with(&banner),
+        "the banner must be the last bytes on the stream even when stdout was \
+         left mid-line; got {line:?}"
+    );
+    assert!(
+        line.starts_with("PARTIAL-STDOUT-NO-NEWLINE"),
+        "the partial stdout line should have been flushed onto the stream just \
+         before the banner, not lost and not emitted after it; got {line:?}"
+    );
+}
+
 /// The banner identifies the name it was *invoked* as, not a hardcoded one.
 ///
 /// `bd` is a symlink to the `br` binary in every deployment in this fleet, and
