@@ -297,6 +297,19 @@ fn banner_is_not_gated_on_being_piped() {
         stdout.is_empty(),
         "a failure must still write nothing to stdout: {stdout:?}"
     );
+
+    // Exactly ONE banner. Nine call sites funnel into one function, and a
+    // second one creeping in (an exit path that emits and then exits through
+    // the funnel again) would be invisible to `tail -1` — it looks identical.
+    let stderr = std::fs::read_to_string(workspace.root.join("err.txt")).expect("err.txt");
+    let banners = stderr
+        .lines()
+        .filter(|line| line.starts_with("br: ") && line.contains("exit 4"))
+        .count();
+    assert_eq!(
+        banners, 1,
+        "expected exactly one banner line, found {banners} in {stderr:?}"
+    );
 }
 
 /// The success path gains nothing.

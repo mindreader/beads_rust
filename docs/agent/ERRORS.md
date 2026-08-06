@@ -2,6 +2,65 @@
 
 Most commands return non-zero exit codes on failure and may emit a structured error envelope.
 
+## The final line: `br: FAILED (CODE, exit N)`
+
+Every nonzero exit ends with **one** self-identifying line on stderr, and it is
+the **last** thing written:
+
+```console
+$ br create "" --prefix ct --json 2>&1 | tail -1
+br: FAILED (VALIDATION_FAILED, exit 4)
+```
+
+Why last, and why this matters: `br`'s stream routing was always correct — a
+failing command writes nothing to stdout and the whole envelope to stderr — so
+piping alone hid nothing. What hid failures was `2>&1` **plus** a truncating
+filter. Every discriminating token in the envelope (`"error"`, the code, the
+message) is at the *top*, and `tail` shows the *bottom*, so what survived was
+closing braces — which is also how a *success* envelope ends. A banner printed
+first would be the first thing cut off; this one is positioned to be the thing
+that survives.
+
+Properties you can rely on:
+
+- **Unconditional on nonzero exit.** Not gated on being a terminal or on being
+  piped, so it behaves identically by hand and in a script.
+- **Last.** stdout is flushed immediately before it is written, so it does not
+  lose the position to a buffered partial line under `2>&1`.
+- **One line, no ANSI, on stderr.** `grep` matches it; `tail -1` shows all of
+  it; a `--json` consumer reading stdout is byte-for-byte unaffected.
+- **It never claims a failure that did not happen.** A nonzero exit that is a
+  *result* rather than an error reads `br: UPDATE_AVAILABLE (exit 1)` — no
+  `FAILED`. It matches the `"error"`/`"notice"` split of the envelopes below.
+- The name is whatever you invoked (`bd` through the symlink, `br` otherwise).
+
+Not covered, because no user code runs: death by signal (`SIGKILL`,
+`SIGTERM`). A fatal panic *is* covered.
+
+### This does NOT fix the exit code — and that is the half that bites hardest
+
+The banner hardens the **text** channel only. `$?` after a pipeline is the
+*last* command's status by shell semantics, so this still reports success:
+
+```bash
+br create "" --prefix ct | tail -3   # $? is tail's 0, and always will be
+```
+
+No change to `br` can alter that. If you care about the status of a piped
+`br`, you must ask for it:
+
+```bash
+set -o pipefail                       # then $? is br's 4
+br ... | tail -3
+# or
+br ... > out.txt; status=$?           # don't pipe what you need the status of
+# or
+br ... | tail -3; status=${PIPESTATUS[0]}   # bash
+```
+
+Seeing `br: FAILED (...)` in a log is *not* evidence that the surrounding
+script noticed.
+
 Example (captured with stderr redirection):
 
 ```bash
