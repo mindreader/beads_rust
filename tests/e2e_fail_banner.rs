@@ -224,10 +224,7 @@ fn where_without_a_beads_dir_gets_the_banner() {
 
     let out = sh(&workspace, r#""$BR" where 2>&1 | tail -1"#);
 
-    assert_eq!(
-        last_line(&out),
-        "br: FAILED (NO_BEADS_DIR, exit 1)"
-    );
+    assert_eq!(last_line(&out), "br: FAILED (NO_BEADS_DIR, exit 1)");
 }
 
 /// Requirement 5, `br config get` on a key that is not set.
@@ -411,7 +408,10 @@ fn a_fatal_panic_still_names_itself() {
 
     assert_eq!(
         last_line(&out),
-        format!("br: FAILED (PANIC, exit {})", beads_rust::exit::panic_exit_status()),
+        format!(
+            "br: FAILED (PANIC, exit {})",
+            beads_rust::exit::panic_exit_status()
+        ),
         "a panic is the most catastrophic exit and the most likely to leave a \
          truncated scrollback; it must name itself last too"
     );
