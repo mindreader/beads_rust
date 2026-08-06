@@ -111,11 +111,25 @@ fn install_broken_pipe_guard() {
 /// Gated on `debug_assertions`, so it cannot exist in the shipped release
 /// binary. (The abort-profile verification described in that test builds
 /// release *with* debug assertions on via `--config` to reach it.)
+///
+/// `BD_PANIC_FOR_TEST=partial-stdout` additionally leaves an unterminated line
+/// in stdout's buffer first. That is the *only* way to observe the
+/// `stdout().flush()` inside [`beads_rust::exit::emit_exit_banner`]: stdout is a
+/// `LineWriter`, so buffered bytes are only ever pending when a printer stopped
+/// mid-line, and no command in the tree today both stops mid-line and then
+/// fails. Without that flush the pending bytes are emitted by std's exit cleanup
+/// *after* the banner (under unwinding) or dropped entirely (under
+/// `panic = "abort"`) — the first of which is precisely the "banner is usually
+/// last" outcome this feature must not ship.
 #[cfg(debug_assertions)]
 fn maybe_panic_for_test() {
-    if std::env::var_os("BD_PANIC_FOR_TEST").is_some() {
-        panic!("BD_PANIC_FOR_TEST: deliberate panic for the failure-banner test");
+    let Some(mode) = std::env::var_os("BD_PANIC_FOR_TEST") else {
+        return;
+    };
+    if mode == *"partial-stdout" {
+        print!("PARTIAL-STDOUT-NO-NEWLINE");
     }
+    panic!("BD_PANIC_FOR_TEST: deliberate panic for the failure-banner test");
 }
 
 /// Is this panic a failed write caused by the reader going away?
