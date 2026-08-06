@@ -281,14 +281,22 @@ grep -v '^warning:' err.json | jq . >/dev/null 2>&1; echo "wrong_case_strip=$?"
     );
 
     // The documented recipes extract the code.
-    assert_eq!(field("right_sed"), "NOTHING_TO_DO", "sed window form: {text}");
+    assert_eq!(
+        field("right_sed"),
+        "NOTHING_TO_DO",
+        "sed window form: {text}"
+    );
     assert_eq!(field("right_sed_status"), "0", "sed window status: {text}");
     assert_eq!(
         field("right_python"),
         "NOTHING_TO_DO",
         "raw_decode form: {text}"
     );
-    assert_eq!(field("right_python_status"), "0", "raw_decode status: {text}");
+    assert_eq!(
+        field("right_python_status"),
+        "0",
+        "raw_decode status: {text}"
+    );
 
     // And the documented traps really are traps. Asserted nonzero rather than
     // 5 so this does not become a test of jq's exit-code scheme.
