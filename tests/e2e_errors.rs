@@ -1233,87 +1233,205 @@ fn e2e_error_text_json_parity_validation() {
 ///
 /// This is the premise the documented recipe in `docs/agent/ERRORS.md` used to
 /// rest on (`br ... 2>err.json; jq . err.json`). It has been false for as long
-/// as `close` has printed `warning:` lines and the sync layer has logged on its
-/// way out: `jq .` on that stderr exits 5. `parse_error_json` above was written
-/// tolerant of *leading* noise only, which is the fossil of someone hitting the
-/// first half of this and patching the reader instead of the premise.
+/// as `close` has printed `warning:` lines: `jq .` on that stderr exits 5.
+/// `parse_error_json` was written tolerant of *leading* noise only, which is the
+/// fossil of someone hitting the first half of this and patching the reader
+/// instead of the premise.
 ///
-/// The banner adds one more trailing line, so this test pins the whole shape at
-/// once: something before the envelope, the envelope, something after it, and
-/// the envelope still extractable. What must NOT regress is the extraction; the
-/// noise around it is not a defect to be removed, it is the contract.
+/// Three shapes, three different generators, pinned separately because a fix
+/// for one does not imply the others:
+///
+/// - **(a) the negative control**: envelope alone, no leading noise. It passes
+///   with any reader, including a broken one, and it is the case a natural test
+///   would have chosen — which is exactly why this survived.
+/// - **(b) one warning, then the envelope.**
+/// - **(c) two warnings, then the envelope.** One invocation can emit the
+///   contention warning more than once.
+///
+/// All three carry the banner as a trailing line, so each also pins the other
+/// end of the stream.
+///
+/// Why this is more than tidiness: the warning generator is a *contention*
+/// warning ("another agent may be working on this issue"). The envelope becomes
+/// unparseable precisely on the concurrency paths — two agents colliding on one
+/// bead — which is when the exact error detail matters most and when nobody is
+/// watching the scrollback. The parse breaks in inverse proportion to how much
+/// you need it.
 #[test]
-fn stderr_is_a_mixed_stream_not_a_json_document() {
-    let _log = common::test_log("stderr_is_a_mixed_stream_not_a_json_document");
+fn envelope_is_readable_under_every_leading_noise_shape() {
+    let _log = common::test_log("envelope_is_readable_under_every_leading_noise_shape");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init: {}", init.stderr);
 
-    // A blocked close: it logs before the envelope and exits nonzero, so the
-    // stream has content on both sides of the JSON.
-    let blocker = create_issue(&workspace, "blocker", "mixed_blocker");
-    let blocked = create_issue(&workspace, "blocked", "mixed_blocked");
+    // A blocked issue gives a nonzero close, and an already-closed issue gives
+    // the contention warning. Repeating the closed id repeats the warning.
+    let blocker = create_issue(&workspace, "blocker", "noise_blocker");
+    let blocked = create_issue(&workspace, "blocked", "noise_blocked");
     let dep = run_br(
         &workspace,
         ["dep", "add", &blocked, &blocker],
-        "mixed_dep_add",
+        "noise_dep_add",
     );
     assert!(dep.status.success(), "dep add: {}", dep.stderr);
 
-    let result = run_br(
-        &workspace,
-        ["close", &blocked, "--json"],
-        "mixed_close_blocked",
-    );
-    assert_eq!(
-        result.status.code(),
-        Some(3),
-        "a blocked close should exit 3: {}",
-        result.stderr
-    );
+    let closed = create_issue(&workspace, "already closed", "noise_closed");
+    let first = run_br(&workspace, ["close", &closed], "noise_close_first");
+    assert!(first.status.success(), "first close: {}", first.stderr);
 
-    let stderr = &result.stderr;
-    let brace = stderr.find('{').expect("no envelope on stderr");
-    let close_brace = stderr.rfind('}').expect("no closing brace on stderr");
+    struct Shape {
+        name: &'static str,
+        args: Vec<String>,
+        warnings: usize,
+        code: &'static str,
+        exit: i32,
+    }
 
-    // 1. The premise is false: the whole stream is not a JSON document.
-    assert!(
-        serde_json::from_str::<Value>(stderr).is_err(),
-        "if stderr ever becomes a single JSON document, the docs and the \
-         helpers can be simplified — until then do not write a reader that \
-         assumes it: {stderr}"
-    );
+    let shapes = vec![
+        Shape {
+            name: "(a) negative control: envelope alone, no leading noise",
+            args: vec!["show".into(), "bd-nonexistent".into(), "--json".into()],
+            warnings: 0,
+            code: "ISSUE_NOT_FOUND",
+            exit: 3,
+        },
+        Shape {
+            name: "(b) one warning, then the envelope",
+            args: vec![
+                "close".into(),
+                closed.clone(),
+                blocked.clone(),
+                "--json".into(),
+            ],
+            warnings: 1,
+            code: "NOTHING_TO_DO",
+            exit: 3,
+        },
+        Shape {
+            name: "(c) two warnings, then the envelope",
+            args: vec![
+                "close".into(),
+                closed.clone(),
+                closed.clone(),
+                blocked.clone(),
+                "--json".into(),
+            ],
+            warnings: 2,
+            code: "NOTHING_TO_DO",
+            exit: 3,
+        },
+    ];
 
-    // 2. There is non-JSON content BEFORE the envelope.
-    assert!(
-        brace > 0 && !stderr[..brace].trim().is_empty(),
-        "expected diagnostics before the envelope: {stderr}"
-    );
+    for shape in shapes {
+        let label = format!("noise_shape_{}", shape.warnings);
+        let result = run_br(&workspace, &shape.args, &label);
+        let stderr = &result.stderr;
+        let what = shape.name;
 
-    // 3. And AFTER it — the banner, plus whatever the command logs on the way
-    //    out. This is the half the old helper got wrong.
-    assert!(
-        !stderr[close_brace + 1..].trim().is_empty(),
-        "expected trailing content after the envelope: {stderr}"
-    );
+        assert_eq!(
+            result.status.code(),
+            Some(shape.exit),
+            "{what}: exit code: {stderr}"
+        );
 
-    // 4. The envelope is still extractable, which is the only thing a consumer
-    //    needs to be true. This assertion is deliberately BEFORE the banner
-    //    check: it fails with the old leading-noise-only helper even on a
-    //    binary with no banner at all, which is how the helper bug is shown to
-    //    be pre-existing rather than banner-induced.
-    let json = parse_error_json(stderr).expect("envelope must survive the noise around it");
-    assert_eq!(json["error"]["code"], "NOTHING_TO_DO");
-    assert!(verify_error_structure(&json), "envelope shape: {json}");
-
-    // 5. And the banner is the last line of that stream.
-    assert!(
-        stderr
+        let warnings = stderr
             .lines()
-            .next_back()
-            .is_some_and(|line| line.contains("FAILED (NOTHING_TO_DO, exit 3)")),
-        "the banner must be the last line of the mixed stream: {stderr}"
-    );
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.starts_with("warning:")
+            })
+            .count();
+        assert_eq!(
+            warnings, shape.warnings,
+            "{what}: expected {} warning line(s); if a generator changed, this \
+             test's premise moved and the counts need re-deriving: {stderr}",
+            shape.warnings
+        );
+
+        // The reader must scan to the first '{'. Nothing weaker works: dropping
+        // a fixed number of leading lines is defeated by shape (c), and
+        // matching a case-sensitive `warning:` prefix is defeated by the
+        // capital-W generator (see the fixture test below).
+        let json = parse_error_json(stderr)
+            .unwrap_or_else(|| panic!("{what}: envelope must be extractable: {stderr}"));
+        assert_eq!(json["error"]["code"], shape.code, "{what}: envelope code");
+        assert!(
+            verify_error_structure(&json),
+            "{what}: envelope shape: {json}"
+        );
+
+        // And the banner is the last line of that stream, whatever preceded it.
+        let last = stderr.lines().next_back().unwrap_or_default();
+        assert!(
+            last.contains(&format!("FAILED ({}, exit {})", shape.code, shape.exit)),
+            "{what}: banner must be last: {stderr}"
+        );
+
+        // Shape (a) is the control: it is the one a broken reader also passes.
+        if shape.warnings == 0 {
+            assert!(
+                stderr.starts_with('{'),
+                "{what}: the control must have no leading noise, otherwise it \
+                 is not controlling for anything: {stderr}"
+            );
+        }
+    }
+}
+
+/// The reader itself, against every noise shape the tree can produce — including
+/// **mixed capitalisation**, which no CLI path can currently put in front of a
+/// JSON error envelope but which the tree is one refactor away from producing.
+///
+/// There are two warning generators with different spellings:
+/// `src/cli/commands/update.rs` writes lowercase `warning:` unconditionally,
+/// while `src/output/context.rs` writes capital `Warning:` and is suppressed in
+/// JSON mode. So a reader that matched `^warning:` case-sensitively would pass
+/// every end-to-end test above and still break the day the other generator
+/// reaches a JSON error path. Fixtures, not invocations, are the honest way to
+/// pin that: this test says what the reader must tolerate rather than what the
+/// binary happens to emit today.
+#[test]
+fn envelope_reader_tolerates_mixed_capitalisation_and_trailing_noise() {
+    let _log = common::test_log("envelope_reader_tolerates_mixed_capitalisation_and_trailing_noise");
+    let envelope = "{\n  \"error\": {\n    \"code\": \"NOTHING_TO_DO\",\n    \
+                    \"message\": \"m\",\n    \"retryable\": false\n  }\n}\n";
+    let lower = "warning: ct-1 is already 'closed' (set 50m ago by 'toad') — \
+                 another agent may be working on this issue\n";
+    let upper = "Warning: invalid label 'a b': labels may not contain spaces\n";
+    let log = "2026-08-06T16:41:14.666352Z  INFO beads_rust::cli::commands::close: \
+               src/cli/commands/close.rs:151: Executing close command\n";
+    let trailing_log = "2026-08-06T16:41:14.676425Z DEBUG beads_rust::sync: \
+                        src/sync/mod.rs:1853: Auto-flush: no dirty issues, skipping\n";
+    let banner = "br: FAILED (NOTHING_TO_DO, exit 3)\n";
+
+    let leading: Vec<(&str, String)> = vec![
+        ("nothing", String::new()),
+        ("a log line", log.to_string()),
+        ("one lowercase warning", lower.to_string()),
+        ("two lowercase warnings", format!("{lower}{lower}")),
+        ("lowercase then capital", format!("{lower}{upper}")),
+        ("capital then lowercase", format!("{upper}{lower}")),
+        ("logs and both spellings", format!("{log}{upper}{lower}")),
+    ];
+    let trailing: Vec<(&str, String)> = vec![
+        ("nothing", String::new()),
+        ("the banner", banner.to_string()),
+        ("a log line", trailing_log.to_string()),
+        ("a log line then the banner", format!("{trailing_log}{banner}")),
+    ];
+
+    for (before_name, before) in &leading {
+        for (after_name, after) in &trailing {
+            let stderr = format!("{before}{envelope}{after}");
+            let json = parse_error_json(&stderr).unwrap_or_else(|| {
+                panic!("reader failed with {before_name} before and {after_name} after: {stderr}")
+            });
+            assert_eq!(
+                json["error"]["code"], "NOTHING_TO_DO",
+                "wrong value extracted with {before_name} before and {after_name} after"
+            );
+        }
+    }
 }
 
 /// The trailing-noise half of the contract, demonstrated with NO banner in the
